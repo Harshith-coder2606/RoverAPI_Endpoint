@@ -58,27 +58,6 @@ class ManagerConcurrencyTests(unittest.TestCase):
         manager.disconnect()
         self.assertEqual(manager._latest_messages, {})
 
-    def test_late_microscope_open_releases_the_unclaimed_device(self):
-        manager = microscope.MicroscopeManager()
-        entered, release, released = threading.Event(), threading.Event(), threading.Event()
-        device = Mock()
-        device.release.side_effect = released.set
-        def open_device(*args):
-            entered.set()
-            if not release.wait(3):
-                raise RuntimeError("test did not release open")
-            return device
-        try:
-            with patch.object(microscope.cv2, "VideoCapture", side_effect=open_device) as open_camera:
-                self.assertIsNone(manager._open_microscope_with_timeout(timeout=0.01))
-                self.assertTrue(entered.is_set())
-                self.assertIsNone(manager._open_microscope_with_timeout(timeout=0.01))
-                self.assertEqual(open_camera.call_count, 1)
-                release.set()
-                self.assertTrue(released.wait(2))
-        finally:
-            release.set()
-            manager._executor.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

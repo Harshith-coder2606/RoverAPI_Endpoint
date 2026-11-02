@@ -73,65 +73,7 @@ class CameraEndpointTests(unittest.TestCase):
             asyncio.run(ns['webrtc_offer']('video-not-a-number', SimpleNamespace(fps=24)))
 
 
-    def test_generic_websocket_cameras_reach_the_started_check(self):
-        path = ROOT / 'app/api/navigation/camera_ws.py'
-        tree = ast.parse(path.read_text())
-        node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'camera_stream_ws')
-        node.decorator_list = []
-        node.body = [n for n in node.body if not isinstance(n, ast.ImportFrom)]
-        class Socket:
-            def __init__(self): self.messages = []
-            async def accept(self): pass
-            async def send_json(self, message): self.messages.append(message)
-            async def close(self, **kwargs): pass
-        ns = {'camera_manager': self.manager, 'CAMERA_DEVICES': {'science': 'device'},
-              'WebSocket': object, 'Query': lambda default, **kwargs: default,
-              'DEFAULT_QUALITY': 85, 'DEFAULT_FPS': 30, 'asyncio': asyncio}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), ns)
-        self.manager.get_camera_status.return_value = {'active': False}
-        socket = Socket()
-        asyncio.run(ns['camera_stream_ws'](socket, 'video3'))
-        self.assertIn('not started', socket.messages[0]['message'])
-        self.manager.get_camera_status.assert_called_once_with('video3')
 
-class CameraConcurrencyTests(unittest.TestCase):
-    def setUp(self):
-        tree = ast.parse(SOURCE.read_text())
-        node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MultiCameraManager')
-        cv = SimpleNamespace(VideoCapture=object, CAP_PROP_FRAME_WIDTH=1, CAP_PROP_FRAME_HEIGHT=2, CAP_PROP_FPS=3, CAP_PROP_BUFFERSIZE=4)
-        ns = {'cv2': cv, 'threading': threading, 'Optional': Optional}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), 'exec'), ns)
-        self.manager = ns['MultiCameraManager']()
-
-    def test_concurrent_starts_open_one_device(self):
-        camera = Mock(); camera.isOpened.return_value = True
-        self.manager._open_camera = Mock(return_value=camera)
-        self.manager._device_path = lambda name: 'fake-device'
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            self.assertTrue(all(pool.map(lambda _: self.manager.start_camera('science'), range(8))))
-        self.manager._open_camera.assert_called_once_with('science')
-
-    def test_stop_waits_for_its_read_without_blocking_another_camera(self):
-        reading = threading.Event(); finish = threading.Event()
-        camera = Mock(); camera.isOpened.return_value = True
-        def read():
-            reading.set()
-            if not finish.wait(2): raise RuntimeError('read was not released')
-            return True, 'frame'
-        camera.read.side_effect = read
-        other = Mock(); other.isOpened.return_value = True; other.read.return_value = (True, 'other')
-        self.manager.cameras.update(science=camera, rover=other)
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            capture = pool.submit(self.manager.capture_frame, 'science')
-            self.assertTrue(reading.wait(1))
-            stopping = pool.submit(self.manager.stop_camera, 'science')
-            self.assertEqual(pool.submit(self.manager.capture_frame, 'rover').result(timeout=1), 'other')
-            self.assertFalse(camera.release.called)
-            finish.set()
-            self.assertEqual(capture.result(timeout=1), 'frame')
-            self.assertTrue(stopping.result(timeout=1))
-        self.assertIsNone(self.manager.capture_frame('science'))
-        camera.release.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()

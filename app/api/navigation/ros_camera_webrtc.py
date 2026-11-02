@@ -1,15 +1,7 @@
-"""
-WebRTC-based streaming for ROS camera image topics.
+"""H.264 WebRTC signaling for the shared native GStreamer encoder."""
 
-Provides low-latency, bandwidth-efficient video streaming using
-H.264/VP8 codec via WebRTC peer connections as an alternative to
-the existing MJPEG stream from ros_camera.py.
+import time
 
-Endpoints:
-    POST /ros/camera/webrtc/offer   - SDP offer/answer exchange
-    DELETE /ros/camera/webrtc       - Close all WebRTC connections
-    GET /ros/camera/webrtc/status   - Connection status
-"""
 
 from app.api.ros_image import decode_ros_image
 from fastapi import APIRouter, HTTPException
@@ -20,10 +12,9 @@ from app.ros.manager import ros_manager
 from app.ros.topics import CAMERA_COLOR_IMAGE_RAW_TOPIC
 from app.api.webrtc_utils import (
     handle_offer,
+    get_frame_timing,
     close_all_connections,
     close_peer_connection,
-    update_peer_feedback,
-    VideoFeedback,
     get_connection_count,
     MAX_WEBRTC_CLIENTS_PER_SOURCE,
 )
@@ -37,7 +28,7 @@ class WebRTCOfferRequest(BaseModel):
     sdp: str
     type: str = "offer"
     topic_name: Optional[str] = None
-    fps: Optional[int] = 24
+    fps: Optional[int] = 60
 
 
 def _make_ros_capture(topic: str):
@@ -63,7 +54,7 @@ def _make_ros_capture(topic: str):
 
 
 @router.post("/ros/camera/webrtc/offer")
-async def webrtc_offer(request: WebRTCOfferRequest):
+async def webrtc_offer(request: WebRTCOfferRequest, topic_name: Optional[str] = None):
     """
     Establish a WebRTC peer connection for ROS camera streaming.
 
@@ -75,7 +66,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
         "sdp": "v=0\\r\\no=- ...",
         "type": "offer",
         "topic_name": "/camera/camera/color/image_raw",
-        "fps": 24
+        "fps": 60
     }
     ```
     """
@@ -85,8 +76,8 @@ async def webrtc_offer(request: WebRTCOfferRequest):
             detail="Not connected to ROS. Ensure rosbridge_server is running.",
         )
 
-    topic = request.topic_name or CAMERA_COLOR_IMAGE_RAW_TOPIC
-    fps = max(1, min(60, request.fps or 24))
+    topic = request.topic_name or topic_name or CAMERA_COLOR_IMAGE_RAW_TOPIC
+    fps = max(1, min(60, request.fps or 60))
     source_name = f"ros_camera:{topic}"
 
     capture_fn = _make_ros_capture(topic)
@@ -112,20 +103,14 @@ async def webrtc_offer(request: WebRTCOfferRequest):
         "sdp": answer["sdp"],
         "type": answer["type"],
         "peer_id": answer["peer_id"],
-        "adaptive_quality": answer["adaptive_quality"],
+        "adaptive_quality": False,
+        "codec": "H264",
+        "transport": "UDP",
+        "encoder": "x264-ultrafast",
         "target_fps": answer["target_fps"],
         "topic": topic,
         "fps": fps,
     }
-
-
-@router.post("/ros/camera/webrtc/connections/{peer_id}/feedback")
-async def webrtc_feedback(peer_id: str, feedback: VideoFeedback, topic_name: Optional[str] = None):
-    topic = topic_name or CAMERA_COLOR_IMAGE_RAW_TOPIC
-    result = await update_peer_feedback(f"ros_camera:{topic}", peer_id, feedback.model_dump())
-    if result is None:
-        raise HTTPException(status_code=404, detail="WebRTC viewer not found")
-    return result
 
 
 @router.delete("/ros/camera/webrtc/connections/{peer_id}")
@@ -160,3 +145,12 @@ async def webrtc_status(topic_name: Optional[str] = None):
         "active_connections": count,
         "max_connections": MAX_WEBRTC_CLIENTS_PER_SOURCE,
     }
+
+
+@router.get("/ros/camera/webrtc/connections/{peer_id}/timing")
+async def frame_timing(peer_id: str, topic_name: Optional[str] = None):
+    received = time.time_ns() / 1e6
+    result = await get_frame_timing(f"ros_camera:{topic_name or CAMERA_COLOR_IMAGE_RAW_TOPIC}", peer_id)
+    if result is None:
+        raise HTTPException(404, 'Viewer not found')
+    return {**result, 'server_receive_ms':received, 'server_send_ms':time.time_ns()/1e6}

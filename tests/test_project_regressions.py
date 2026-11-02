@@ -15,8 +15,8 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
-from app.api.navigation import camera, camera_ws, report as nav_report, report_handler as nav_handler, ros_camera, ros_camera_webrtc
-from app.api.science import microscope, microscope_ws, report as sci_report, report_handler as sci_handler, sensor_data
+from app.api.navigation import camera, report as nav_report, report_handler as nav_handler, ros_camera, ros_camera_webrtc
+from app.api.science import microscope, report as sci_report, report_handler as sci_handler, sensor_data
 from app.api.diagnostics import doctor
 from app.api import ros_endpoints
 from app.api.ros_image import decode_ros_image
@@ -26,11 +26,9 @@ from app.utils import expeditions
 def application():
     app = FastAPI()
     app.include_router(camera.router, prefix="/nav")
-    app.include_router(camera_ws.router, prefix="/nav")
     app.include_router(nav_report.router, prefix="/nav")
     app.include_router(sci_report.router, prefix="/sci")
     app.include_router(microscope.router, prefix="/sci")
-    app.include_router(microscope_ws.router, prefix="/sci")
     app.include_router(ros_endpoints.router)
     return app
 
@@ -59,10 +57,19 @@ class StorageRouteTests(unittest.TestCase):
         client = TestClient(application())
         self.assertEqual(client.post("/nav/cameras/rover/start", data={"fps": 0}).status_code, 422)
         self.assertEqual(client.post("/sci/microscope/start", data={"width": 0}).status_code, 422)
-        with self.assertRaises(WebSocketDisconnect) as caught:
-            with client.websocket_connect("/sci/microscope/stream/ws?fps=0"):
-                pass
-        self.assertEqual(caught.exception.code, 1008)
+        self.assertEqual(client.get('/nav/cameras/rover/stream').status_code, 404)
+        self.assertEqual(client.get('/sci/microscope/stream').status_code, 404)
+
+    def test_microscope_snapshot_keeps_device_path_and_registers_metadata(self):
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        with TemporaryDirectory() as directory, patch.object(microscope, 'IMAGE_DIR', directory), patch.object(microscope, 'META_FILE', str(Path(directory)/'metadata.json')), patch.object(microscope.microscope_manager, 'capture_frame', return_value=frame), patch.object(microscope.microscope_manager, 'get_status', return_value={'device_path':'/dev/camera-microscope'}):
+            client = TestClient(application())
+            response = client.post('/sci/microscope/capture')
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(result['metadata']['camera']['device_path'], '/dev/camera-microscope')
+            self.assertTrue((Path(directory)/result['saved']).is_file())
+            self.assertEqual(len(camera.load_json(str(Path(directory)/'metadata.json'))), 1)
 
     def test_static_report_path_route_and_containment(self):
         with TemporaryDirectory() as directory:
@@ -183,30 +190,6 @@ class SensorAndDiagnosticTests(unittest.TestCase):
 
 
 class ResponsivenessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ros_mjpeg_waits_for_a_new_message_instead_of_resending(self):
-        manager = Mock(is_connected=True)
-        first_message = {"frame": 1}
-        manager.get_latest_camera_image.return_value = first_message
-        with patch.object(ros_camera, "ros_manager", manager), patch.object(ros_camera, "encode_ros_jpeg", return_value=b"jpeg") as encode:
-            response = await ros_camera.stream_camera_mjpeg(None, 30, 85)
-            stream = response.body_iterator
-            self.assertIn(b"jpeg", await anext(stream))
-            waiting = asyncio.create_task(anext(stream))
-            try:
-                await asyncio.sleep(0.08)
-                self.assertFalse(waiting.done())
-                self.assertEqual(encode.call_count, 1)
-                manager.get_latest_camera_image.return_value = {"frame": 2}
-                self.assertIn(b"jpeg", await asyncio.wait_for(waiting, 1))
-                self.assertEqual(encode.call_count, 2)
-            finally:
-                if not waiting.done():
-                    waiting.cancel()
-                    try:
-                        await waiting
-                    except asyncio.CancelledError:
-                        pass
-                await stream.aclose()
 
     async def test_ros_webrtc_reuses_decoding_until_message_changes(self):
         manager = Mock()
@@ -221,55 +204,8 @@ class ResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(capture(), frame)
             self.assertEqual(decode.call_count, 2)
 
-    async def test_jpeg_encoding_runs_off_the_event_loop_and_releases_clients(self):
-        entered = threading.Event()
-        release = threading.Event()
-        encoder_threads = []
-        def encode(*args):
-            encoder_threads.append(threading.get_ident())
-            entered.set()
-            if not release.wait(3):
-                raise RuntimeError("test did not release encoder")
-            return b"frame"
-        manager = Mock()
-        manager.get_camera_status.return_value = {"active": True, "width": 640, "height": 480}
-        socket = SimpleNamespace(accept=AsyncMock(), close=AsyncMock(), send_json=AsyncMock(), send_bytes=AsyncMock(side_effect=RuntimeError("viewer left")))
-        async def receive():
-            await asyncio.Future()
-        socket.receive_text = receive
-        connections = camera_ws.WebSocketConnectionManager()
-        with patch.object(camera, "camera_manager", manager), patch.object(camera_ws, "ws_manager", connections), patch.object(camera_ws, "_capture_encoded_frame", side_effect=encode):
-            streaming = asyncio.create_task(camera_ws.camera_stream_ws(socket, "rover", 85, 30))
-            try:
-                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
-                self.assertNotEqual(encoder_threads[0], threading.get_ident())
-                await asyncio.wait_for(asyncio.sleep(0), timeout=0.5)
-            finally:
-                release.set()
-                await streaming
-            self.assertEqual(connections.get_connection_count("rover"), 0)
-            manager.remove_ws_client.assert_called_once_with("rover", socket)
 
-    async def test_cancelled_initial_status_send_releases_client(self):
-        manager = Mock()
-        manager.get_camera_status.return_value = {"active": True, "width": 640, "height": 480}
-        socket = SimpleNamespace(accept=AsyncMock(), close=AsyncMock(), send_json=AsyncMock(side_effect=asyncio.CancelledError()))
-        connections = camera_ws.WebSocketConnectionManager()
-        with patch.object(camera, "camera_manager", manager), patch.object(camera_ws, "ws_manager", connections):
-            with self.assertRaises(asyncio.CancelledError):
-                await camera_ws.camera_stream_ws(socket, "rover", 85, 30)
-            self.assertEqual(connections.get_connection_count("rover"), 0)
-            manager.remove_ws_client.assert_called_once()
 
-    async def test_microscope_initial_status_failure_releases_client(self):
-        manager = Mock()
-        manager.get_status.return_value = {"active": True, "width": 640, "height": 480}
-        manager.add_ws_client.return_value = True
-        socket = SimpleNamespace(accept=AsyncMock(), close=AsyncMock(), send_json=AsyncMock(side_effect=RuntimeError("viewer left")))
-        with patch.object(microscope_ws, "microscope_manager", manager):
-            with self.assertRaises(RuntimeError):
-                await microscope_ws.microscope_websocket_stream(socket, 85, 30)
-            manager.remove_ws_client.assert_called_once_with(socket)
 
     async def test_slow_ros_connect_does_not_block_health_request(self):
         app = application()
@@ -292,15 +228,6 @@ class ResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                     release.set()
                     await connecting
 
-    async def test_websocket_capacity_is_enforced_atomically(self):
-        manager = camera_ws.WebSocketConnectionManager()
-        sockets = [Mock() for _ in range(20)]
-        outcomes = await asyncio.gather(*(manager.connect("rover", socket, accepted=True) for socket in sockets))
-        self.assertEqual(sum(outcomes), camera_ws.MAX_CLIENTS_PER_CAMERA)
-        for socket, accepted in zip(sockets, outcomes):
-            if accepted:
-                await manager.disconnect("rover", socket)
-        self.assertEqual(manager.get_connection_count("rover"), 0)
 
 
 if __name__ == "__main__":

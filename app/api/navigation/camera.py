@@ -10,7 +10,6 @@ from typing import Optional
 
 import cv2
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
 
 from app.utils.json_store import load_json, save_json, save_json_locked
 from app.utils.expeditions import EXPEDITION_BASE_DIR, get_safe_expedition_dir
@@ -29,348 +28,110 @@ os.makedirs("storage/reports", exist_ok=True)
 
 CAMERA_DEVICES = {
     "microscope": "/dev/camera-microscope",
+    "kreo": "/dev/v4l/by-id/usb-Sonix_Technology_Co.__Ltd._Kreo_Owl_Camera_SN0001-video-index0",
     "arm": "/dev/camera-arm",
     "science": "/dev/camera-science",
     "rover": "/dev/camera-rover",
 }
 
-# Camera hardware management
+# One native capture and encoder owns each physical camera.
 class MultiCameraManager:
     def __init__(self):
-        self.cameras: dict[str, cv2.VideoCapture] = {}
-        self.camera_info: dict[str, dict] = {}
-        self.streaming_status: dict[str, bool] = {}
-        self.ws_clients: dict[str, list] = {}
+        self.cameras = {}
+        self.camera_info = {}
         self._lifecycle_lock = threading.RLock()
-        self._capture_locks: dict[str, threading.RLock] = {}
 
     def _device_path(self, camera_name: str) -> Optional[str]:
         if camera_name in CAMERA_DEVICES:
             return CAMERA_DEVICES[camera_name]
-
-        if camera_name.startswith("video"):
-            try:
-                index = int(camera_name[5:])
-                return f"/dev/video{index}"
-            except ValueError:
-                return None
-
+        if re.fullmatch(r"video[0-9]+", camera_name):
+            return f"/dev/{camera_name}"
         return None
-
-    def _open_camera(self, camera_name: str) -> Optional[cv2.VideoCapture]:
-        device_path = self._device_path(camera_name)
-
-        if device_path is None:
-            print(f"[Camera] Unknown camera: {camera_name}")
-            return None
-
-        if not os.path.exists(device_path):
-            print(f"[Camera] Device does not exist: {device_path}")
-            return None
-
-        print(f"[Camera] RAW OPEN {camera_name} -> {device_path}")
-
-        cap = cv2.VideoCapture(device_path)
-
-        print(
-            f"[Camera] RAW OPEN RETURNED {camera_name}: "
-            f"isOpened={cap.isOpened()}"
-        )
-
-        return cap
 
     def detect_cameras(self):
         available = []
-        used_paths = set()
-
-        print("[Camera] === RAW CAMERA DETECTION START ===")
-
-        # Named cameras
-        for camera_name, device_path in CAMERA_DEVICES.items():
-            used_paths.add(os.path.realpath(device_path))
-
-            print(f"[Camera] Checking named camera {camera_name}: {device_path}")
-
-            if not os.path.exists(device_path):
-                print(f"[Camera] Missing: {device_path}")
+        used = set()
+        candidates = list(CAMERA_DEVICES.items()) + [(p.name, str(p)) for p in sorted(Path('/dev').glob('video[0-9]*'))]
+        for name, device in candidates:
+            real = os.path.realpath(device)
+            if not os.path.exists(device) or real in used:
                 continue
-
-            # If already started, don't try to open the same device twice.
-            if camera_name in self.cameras:
-                camera = self.cameras[camera_name]
-
-                if camera.isOpened():
-                    info = self.camera_info.get(camera_name, {})
-
-                    available.append({
-                        "name": camera_name,
-                        "device_path": device_path,
-                        "backend": "V4L2",
-                        "default_resolution":
-                            f"{info.get('width', 640)}x{info.get('height', 480)}",
-                        "default_fps": info.get("fps", 30),
-                        "active": True,
-                        "is_named": True,
-                    })
-
-                    continue
-
-            print(f"[Camera] Opening named camera {camera_name}")
-
-            cap = cv2.VideoCapture(device_path)
-
-            print(
-                f"[Camera] VideoCapture returned for {camera_name}: "
-                f"{cap.isOpened()}"
-            )
-
-            if not cap.isOpened():
-                cap.release()
-                continue
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-
-            try:
-                backend = cap.getBackendName()
-            except Exception:
-                backend = "unknown"
-
-            available.append({
-                "name": camera_name,
-                "device_path": device_path,
-                "backend": backend,
-                "default_resolution": f"{width}x{height}",
-                "default_fps": fps,
-                "active": False,
-                "is_named": True,
-            })
-
-            print(
-                f"[Camera] Detected {camera_name}: "
-                f"{width}x{height} @ {fps}"
-            )
-
-            cap.release()
-
-        # Raw /dev/videoN enumeration
-        for i in range(20):
-            device_path = f"/dev/video{i}"
-
-            if not os.path.exists(device_path):
-                continue
-
-            # Resolve symlinks so named devices aren't opened again.
-            real_path = os.path.realpath(device_path)
-
-            if real_path in used_paths:
-                continue
-
-            camera_name = f"video{i}"
-
-            print(f"[Camera] Checking generic {camera_name}: {device_path}")
-
-            if camera_name in self.cameras:
-                camera = self.cameras[camera_name]
-
-                if camera.isOpened():
-                    info = self.camera_info.get(camera_name, {})
-
-                    available.append({
-                        "name": camera_name,
-                        "device_path": device_path,
-                        "backend": "V4L2",
-                        "default_resolution":
-                            f"{info.get('width', 640)}x{info.get('height', 480)}",
-                        "default_fps": info.get("fps", 30),
-                        "active": True,
-                        "is_named": False,
-                    })
-
-                    continue
-
-            print(f"[Camera] RAW generic open: {device_path}")
-
-            cap = cv2.VideoCapture(device_path)
-
-            print(
-                f"[Camera] RAW generic open returned: {device_path}: "
-                f"{cap.isOpened()}"
-            )
-
-            if not cap.isOpened():
-                cap.release()
-                continue
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-
-            try:
-                backend = cap.getBackendName()
-            except Exception:
-                backend = "unknown"
-
-            available.append({
-                "name": camera_name,
-                "device_path": device_path,
-                "backend": backend,
-                "default_resolution": f"{width}x{height}",
-                "default_fps": fps,
-                "active": False,
-                "is_named": False,
-            })
-
-            cap.release()
-
-        print(
-            f"[Camera] === RAW CAMERA DETECTION END: "
-            f"{len(available)} found ==="
-        )
-
+            formats = self.get_supported_resolutions(name).get('formats', [])
+            if not any(f['fourcc'] in ('MJPG', 'YUYV') for f in formats):
+                continue  # Ignore V4L2 metadata nodes without video capture formats.
+            used.add(real)
+            modes = [(r, f['fourcc'], rate) for f in formats for r in f.get('resolutions', [])
+                     for rate in r.get('frame_rates', [30]) if 0 < rate <= 60]
+            preferred = [m for m in modes if m[0]['width'] == 1280 and m[0]['height'] == 720]
+            best = max(preferred or modes, key=lambda m: (m[2], m[1] == 'MJPG'), default=({'width':1280,'height':720},'MJPG',30))
+            available.append({'name':name, 'device_path':device, 'backend':'GStreamer H.264',
+                              'default_resolution':f"{best[0]['width']}x{best[0]['height']}",
+                              'default_fps':best[2], 'active':self.get_camera_status(name)['active'],
+                              'is_named':name in CAMERA_DEVICES})
         return available
 
-    def start_camera(
-        self,
-        camera_name: str,
-        width: int = 640,
-        height: int = 480,
-        fps: int = 30,
-        pixel_format: Optional[str] = None,
-    ):
+    def start_camera(self, camera_name, width=1280, height=720, fps=60, pixel_format=None):
+        from app.media.gstreamer import GStreamerSource
         with self._lifecycle_lock:
-            existing = self.cameras.get(camera_name)
-
-            if existing is not None and existing.isOpened():
-                print(f"[Camera] {camera_name} already started")
-                return True
-
-            print(f"[Camera] Starting {camera_name}")
-
-            camera = self._open_camera(camera_name)
-
-            if camera is None:
+            device = self._device_path(camera_name)
+            if not device or not os.path.exists(device):
                 return False
-
-            if not camera.isOpened():
-                print(f"[Camera] Failed to open {camera_name}")
-                camera.release()
-                return False
-
-            if pixel_format:
-                camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*pixel_format))
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            camera.set(cv2.CAP_PROP_FPS, fps)
-            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            device_path = self._device_path(camera_name) or ""
-
-            self.cameras[camera_name] = camera
-            self.camera_info[camera_name] = {
-                "width": width,
-                "height": height,
-                "fps": fps,
-                "device_path": device_path,
-            }
-            self.streaming_status[camera_name] = False
-
-            print(f"[Camera] Started {camera_name}")
-
+            real = os.path.realpath(device)
+            for name, source in list(self.cameras.items()):
+                if os.path.realpath(self.camera_info[name]['device_path']) == real:
+                    if source.status()['active']:
+                        if (source.width, source.height, source.fps) != (width, height, fps):
+                            raise HTTPException(409, 'Camera already shared at a different mode. Stop it before changing resolution.')
+                        self.cameras[camera_name] = source
+                        self.camera_info[camera_name] = dict(self.camera_info[name])
+                        return True
+                    source.stop()
+                    self.cameras.pop(name, None)
+                    self.camera_info.pop(name, None)
+            try:
+                if pixel_format is None:
+                    formats = self.get_supported_resolutions(camera_name).get('formats', [])
+                    pixel_format = 'MJPG' if any(f['fourcc'] == 'MJPG' for f in formats) else 'YUYV'
+                source = GStreamerSource(device, width, height, fps, pixel_format)
+            except Exception as exc:
+                raise HTTPException(503, f'Camera could not start: {exc}') from exc
+            self.cameras[camera_name] = source
+            self.camera_info[camera_name] = {'width':width, 'height':height, 'fps':fps, 'device_path':device}
             return True
 
-    def stop_camera(self, camera_name: str):
+    def stop_camera(self, camera_name):
         with self._lifecycle_lock:
-            camera = self.cameras.get(camera_name)
-
-            if camera is None:
+            source = self.cameras.get(camera_name)
+            if source is None:
                 return False
-
-            print(f"[Camera] Releasing {camera_name}")
-
-            with self._capture_locks.setdefault(camera_name, threading.RLock()):
-                camera.release()
-                self.cameras.pop(camera_name, None)
-
-            self.camera_info.pop(camera_name, None)
-            self.streaming_status.pop(camera_name, None)
-
+            source.stop()
+            for name in [n for n, s in self.cameras.items() if s is source]:
+                self.cameras.pop(name, None)
+                self.camera_info.pop(name, None)
             return True
 
     def stop_all_cameras(self):
         with self._lifecycle_lock:
-            for name, camera in list(self.cameras.items()):
-                print(f"[Camera] Releasing {name}")
-                with self._capture_locks.setdefault(name, threading.RLock()):
-                    camera.release()
-                    self.cameras.pop(name, None)
-
+            for source in set(self.cameras.values()):
+                source.stop()
             self.cameras.clear()
             self.camera_info.clear()
-            self.streaming_status.clear()
 
-    def capture_frame(self, camera_name: str):
-        with self._capture_locks.setdefault(camera_name, threading.RLock()):
-            camera = self.cameras.get(camera_name)
+    def capture_frame(self, camera_name):
+        source = self.cameras.get(camera_name)
+        return source.capture_frame() if source else None
 
-            if camera is None:
-                return None
-
-            if not camera.isOpened():
-                return None
-
-            ret, frame = camera.read()
-
-            if not ret:
-                return None
-
-            return frame
-
-    def get_camera_status(self, camera_name: str):
-        with self._capture_locks.setdefault(camera_name, threading.RLock()):
-            camera = self.cameras.get(camera_name)
-
-            if camera is None or not camera.isOpened():
-                return {
-                    "active": False,
-                    "streaming": False,
-                    "ws_clients": 0,
-                }
-
-            info = self.camera_info.get(camera_name, {})
-
-            return {
-                "active": True,
-                "streaming": self.streaming_status.get(camera_name, False),
-                "camera_name": camera_name,
-                "device_path": info.get("device_path", ""),
-                "width": int(camera.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                "height": int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                "fps": int(camera.get(cv2.CAP_PROP_FPS)),
-                "ws_clients": self.get_ws_client_count(camera_name),
-            }
+    def get_camera_status(self, camera_name):
+        source = self.cameras.get(camera_name)
+        status = source.status() if source else {'active':False, 'peers':[], 'fps':0}
+        info = self.camera_info.get(camera_name, {})
+        return {**info, 'active':status['active'], 'streaming':bool(status['peers']),
+                'camera_name':camera_name, 'fps':source.fps if source else 0,
+                'measured_fps':status['fps'], 'transport':'H264/RTP/UDP',
+                'encoder':'x264-ultrafast', 'active_connections':len(status['peers'])}
 
     def get_all_statuses(self):
-        return {name: self.get_camera_status(name) for name in list(self.cameras)}
-
-    def add_ws_client(self, camera_name: str, websocket):
-        self.ws_clients.setdefault(camera_name, []).append(websocket)
-
-    def remove_ws_client(self, camera_name: str, websocket):
-        clients = self.ws_clients.get(camera_name)
-
-        if not clients:
-            return
-
-        if websocket in clients:
-            clients.remove(websocket)
-
-        if not clients:
-            self.ws_clients.pop(camera_name, None)
-
-    def get_ws_client_count(self, camera_name: str):
-        return len(self.ws_clients.get(camera_name, []))
+        return {name:self.get_camera_status(name) for name in list(self.cameras)}
 
     def get_supported_resolutions(self, camera_name: str) -> dict:
         """Query supported resolutions for a camera using v4l2-ctl"""
@@ -601,9 +362,9 @@ def get_camera_resolutions(camera_name: str):
 @router.post("/cameras/{camera_name}/start")
 def start_camera(
     camera_name: str,
-    width: int = Form(640, ge=1),
-    height: int = Form(480, ge=1),
-    fps: int = Form(30, ge=1, le=60),
+    width: int = Form(1280, ge=1),
+    height: int = Form(720, ge=1),
+    fps: int = Form(60, ge=1, le=60),
     pixel_format: Optional[str] = Form(None),
 ):
     """Start specific camera"""
@@ -618,7 +379,7 @@ def start_camera(
             detail=f"Camera '{camera_name}' not found. Available named cameras: {', '.join(CAMERA_DEVICES.keys())}. Also supports video0, video1, etc.",
         )
 
-    if pixel_format and not re.fullmatch(r"[A-Z0-9]{4}", pixel_format):
+    if pixel_format and pixel_format not in ('MJPG', 'YUYV'):
         raise HTTPException(status_code=400, detail="Invalid camera pixel format")
     success = camera_manager.start_camera(camera_name, width, height, fps, pixel_format)
     if not success:
@@ -756,50 +517,6 @@ def capture_from_camera(
         "metadata": entry,
         "file_size_mb": round(file_size / (1024 * 1024), 2),
     }
-
-
-def generate_video_stream(camera_name: str, target_fps: int = 30, quality: int = 85):
-    """Generator function for MJPEG video streaming from specific camera"""
-    frame_delay = 1.0 / target_fps
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-    while True:
-        frame_started = time.monotonic()
-        frame = camera_manager.capture_frame(camera_name)
-        if frame is None:
-            break
-
-        # Encode frame as JPEG
-        ret, buffer = cv2.imencode(".jpg", frame, encode_param)
-        if not ret:
-            continue
-
-        frame_bytes = buffer.tobytes()
-
-        # Yield frame in multipart format
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
-
-        time.sleep(max(0, frame_delay - (time.monotonic() - frame_started)))
-
-
-@router.get("/cameras/{camera_name}/stream")
-def video_stream(
-    camera_name: str,
-    fps: int = Query(30, ge=1, le=60),
-    quality: int = Query(85, ge=1, le=100),
-):
-    """Stream live video feed from specific camera (MJPEG)"""
-    status = camera_manager.get_camera_status(camera_name)
-    if not status["active"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Camera '{camera_name}' not started. Call /cameras/{camera_name}/start first",
-        )
-
-    camera_manager.streaming_status[camera_name] = True
-    return StreamingResponse(
-        generate_video_stream(camera_name, target_fps=fps, quality=quality),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
 
 
 @router.post("/capture")

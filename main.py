@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import router
 from app.ros.manager import ros_manager
 
-# Configure logging so WebRTC / aiortc diagnostics are visible
+# Configure media and connection diagnostics
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -62,19 +62,8 @@ async def shutdown_event():
     """Clean up WebRTC connections and disconnect from ROS bridge on shutdown"""
     print("Shutting down Rover API Server...")
 
-    # Close all WebRTC peer connections gracefully
-    from app.api.webrtc_utils import _peer_connections, _pc_lock
-
-    async with _pc_lock:
-        all_sources = list(_peer_connections.keys())
-
-    if all_sources:
-        from app.api.webrtc_utils import close_all_connections
-
-        for source in all_sources:
-            closed = await close_all_connections(source)
-            if closed:
-                print(f"  Closed {closed} WebRTC connection(s) for '{source}'")
+    from app.api.webrtc_utils import shutdown_media
+    await shutdown_media()
 
     from app.api.navigation.camera import camera_manager
     from app.api.science.microscope import microscope_manager
@@ -82,7 +71,6 @@ async def shutdown_event():
 
     await asyncio.to_thread(camera_manager.stop_all_cameras)
     await asyncio.to_thread(microscope_manager.stop_microscope)
-    microscope_manager._executor.shutdown(wait=False, cancel_futures=True)
     await asyncio.to_thread(arduino_manager.disconnect)
     await asyncio.to_thread(ros_manager.disconnect)
 

@@ -60,3 +60,8 @@ storage/fonts/*
 storage/report_sci_gen/
 storage/sci_reports/*
 storage/reports/*
+
+# Local agent context and credentials
+/AGENTS.md
+/.local/
+/.scratch/

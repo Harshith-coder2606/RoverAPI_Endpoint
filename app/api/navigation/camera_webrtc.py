@@ -1,15 +1,7 @@
-"""
-WebRTC-based camera streaming for navigation cameras.
+"""H.264 WebRTC signaling for the shared native GStreamer encoder."""
 
-Provides low-latency, bandwidth-efficient video streaming using
-H.264/VP8 codec via WebRTC peer connections. This is an alternative
-to the existing WebSocket (camera_ws.py) and MJPEG (camera.py) streams.
+import time
 
-Endpoints:
-    POST /cameras/{camera_name}/webrtc/offer  - SDP offer/answer exchange
-    DELETE /cameras/{camera_name}/webrtc       - Close all WebRTC connections
-    GET /cameras/{camera_name}/webrtc/status   - Connection status
-"""
 
 import asyncio
 
@@ -19,10 +11,9 @@ from typing import Optional
 
 from app.api.webrtc_utils import (
     handle_offer,
+    get_frame_timing,
     close_all_connections,
     close_peer_connection,
-    update_peer_feedback,
-    VideoFeedback,
     get_connection_count,
     get_all_webrtc_stats,
     MAX_WEBRTC_CLIENTS_PER_SOURCE,
@@ -36,7 +27,7 @@ class WebRTCOfferRequest(BaseModel):
 
     sdp: str
     type: str = "offer"
-    fps: Optional[int] = 24
+    fps: Optional[int] = 60
 
 
 @router.post("/cameras/{camera_name}/webrtc/offer")
@@ -48,18 +39,17 @@ async def webrtc_offer(
     Establish a WebRTC peer connection for camera streaming.
 
     Send an SDP offer and receive an SDP answer. The server will
-    stream H.264/VP8 encoded video from the specified camera.
+    stream H.264 encoded video from the specified camera.
 
-    This provides better bandwidth efficiency than WebSocket JPEG streaming
-    due to inter-frame compression, and lower latency than MJPEG due to
-    UDP transport.
+    The camera is captured and encoded once by GStreamer. Each viewer
+    receives that H.264 stream over WebRTC UDP without re-encoding.
 
     Example request:
     ```json
     {
         "sdp": "v=0\\r\\no=- ...",
         "type": "offer",
-        "fps": 24
+        "fps": 60
     }
     ```
     """
@@ -83,7 +73,7 @@ async def webrtc_offer(
         )
 
     # Requested delivery target; actual capture FPS is reported separately by the camera.
-    fps = max(1, min(60, request.fps or 24))
+    fps = max(1, min(60, request.fps or 60))
 
     # Create a capture function bound to this camera
     def capture():
@@ -112,19 +102,14 @@ async def webrtc_offer(
         "sdp": answer["sdp"],
         "type": answer["type"],
         "peer_id": answer["peer_id"],
-        "adaptive_quality": answer["adaptive_quality"],
+        "adaptive_quality": False,
+        "codec": "H264",
+        "transport": "UDP",
+        "encoder": "x264-ultrafast",
         "target_fps": answer["target_fps"],
         "camera_name": camera_name,
         "fps": fps,
     }
-
-
-@router.post("/cameras/{camera_name}/webrtc/connections/{peer_id}/feedback")
-async def webrtc_feedback(camera_name: str, peer_id: str, feedback: VideoFeedback):
-    result = await update_peer_feedback(f"camera:{camera_name}", peer_id, feedback.model_dump())
-    if result is None:
-        raise HTTPException(status_code=404, detail="WebRTC viewer not found")
-    return result
 
 
 @router.delete("/cameras/{camera_name}/webrtc/connections/{peer_id}")
@@ -166,3 +151,12 @@ async def webrtc_all_status():
         "success": True,
         "sources": stats,
     }
+
+
+@router.get("/cameras/{camera_name}/webrtc/connections/{peer_id}/timing")
+async def frame_timing(camera_name: str, peer_id: str):
+    received = time.time_ns() / 1e6
+    result = await get_frame_timing(f"camera:{camera_name}", peer_id)
+    if result is None:
+        raise HTTPException(404, 'Viewer not found')
+    return {**result, 'server_receive_ms':received, 'server_send_ms':time.time_ns()/1e6}

@@ -1,15 +1,7 @@
-"""
-WebRTC-based streaming for the science microscope.
+"""H.264 WebRTC signaling for the shared native GStreamer encoder."""
 
-Provides low-latency, bandwidth-efficient video streaming using
-H.264/VP8 codec via WebRTC peer connections as an alternative to
-the existing WebSocket and MJPEG streams.
+import time
 
-Endpoints:
-    POST /microscope/webrtc/offer   - SDP offer/answer exchange
-    DELETE /microscope/webrtc       - Close all WebRTC connections
-    GET /microscope/webrtc/status   - Connection status
-"""
 
 import asyncio
 
@@ -20,10 +12,9 @@ from typing import Optional
 from app.api.science.microscope import microscope_manager
 from app.api.webrtc_utils import (
     handle_offer,
+    get_frame_timing,
     close_all_connections,
     close_peer_connection,
-    update_peer_feedback,
-    VideoFeedback,
     get_connection_count,
     MAX_WEBRTC_CLIENTS_PER_SOURCE,
 )
@@ -38,7 +29,7 @@ class WebRTCOfferRequest(BaseModel):
 
     sdp: str
     type: str = "offer"
-    fps: Optional[int] = 24
+    fps: Optional[int] = 60
 
 
 @router.post("/microscope/webrtc/offer")
@@ -53,7 +44,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
     {
         "sdp": "v=0\\r\\no=- ...",
         "type": "offer",
-        "fps": 24
+        "fps": 60
     }
     ```
     """
@@ -64,7 +55,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
             detail="Microscope not started. Call /microscope/start first",
         )
 
-    fps = max(1, min(60, request.fps or 24))
+    fps = max(1, min(60, request.fps or 60))
 
     try:
         answer = await handle_offer(
@@ -87,18 +78,13 @@ async def webrtc_offer(request: WebRTCOfferRequest):
         "sdp": answer["sdp"],
         "type": answer["type"],
         "peer_id": answer["peer_id"],
-        "adaptive_quality": answer["adaptive_quality"],
+        "adaptive_quality": False,
+        "codec": "H264",
+        "transport": "UDP",
+        "encoder": "x264-ultrafast",
         "target_fps": answer["target_fps"],
         "fps": fps,
     }
-
-
-@router.post("/microscope/webrtc/connections/{peer_id}/feedback")
-async def webrtc_feedback(peer_id: str, feedback: VideoFeedback):
-    result = await update_peer_feedback(SOURCE_NAME, peer_id, feedback.model_dump())
-    if result is None:
-        raise HTTPException(status_code=404, detail="WebRTC viewer not found")
-    return result
 
 
 @router.delete("/microscope/webrtc/connections/{peer_id}")
@@ -127,3 +113,12 @@ async def webrtc_status():
         "active_connections": count,
         "max_connections": MAX_WEBRTC_CLIENTS_PER_SOURCE,
     }
+
+
+@router.get("/microscope/webrtc/connections/{peer_id}/timing")
+async def frame_timing(peer_id: str):
+    received = time.time_ns() / 1e6
+    result = await get_frame_timing(SOURCE_NAME, peer_id)
+    if result is None:
+        raise HTTPException(404, 'Viewer not found')
+    return {**result, 'server_receive_ms':received, 'server_send_ms':time.time_ns()/1e6}

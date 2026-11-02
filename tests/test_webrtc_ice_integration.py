@@ -1,15 +1,14 @@
-"""Real ICE + RTP test; requires the rover's aiortc/av dependencies, no camera.
+"""Real ICE + RTP test; uses aiortc only as a test receiver and requires native GStreamer, no camera.
 
 Run: python -m unittest discover -s tests -p test_webrtc_ice_integration.py
 """
 import asyncio
-import re
 import unittest
 from unittest.mock import patch
 
 try:
     import numpy as np
-    from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+    from aiortc import RTCBundlePolicy, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
     from app.api import webrtc_utils as rtc
 except ImportError:
     rtc = None
@@ -17,9 +16,14 @@ except ImportError:
 
 @unittest.skipIf(rtc is None, "aiortc/av not installed")
 class IceIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unresolvable_mdns_offer_connects_and_delivers_frames(self):
+    async def test_native_h264_ice_connects_and_delivers_frames(self):
         client = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-        source = "test:mdns-integration"
+        source = "camera:test"
+        from app.media.gstreamer import GStreamerSource
+        try:
+            native = GStreamerSource('test', 320, 240, 24)
+        except (RuntimeError, OSError) as error:
+            self.skipTest(str(error))
         track_ready = asyncio.get_running_loop().create_future()
         @client.on("track")
         def on_track(track):
@@ -27,10 +31,8 @@ class IceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         try:
             client.addTransceiver("video", direction="recvonly")
             await client.setLocalDescription(await client.createOffer())
-            offer = re.sub(r"(a=candidate:[^\r\n]+? udp \d+ )[^ ]+", r"\g<1>codex-unresolvable-probe.local", client.localDescription.sdp)
-            self.assertIn(".local", offer)
-            self.assertIn("a=end-of-candidates", offer)
-            with patch.object(rtc, "ICE_CONFIG", RTCConfiguration(iceServers=[])):
+            offer = client.localDescription.sdp
+            with patch.object(rtc, "_hardware_source", return_value=native):
                 answer = await asyncio.wait_for(rtc.handle_offer(source, offer, "offer", lambda: np.zeros((240, 320, 3), dtype=np.uint8), fps=24), 10)
             self.assertIn("a=candidate:", answer["sdp"])
             await client.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
@@ -45,6 +47,48 @@ class IceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
             await rtc.close_all_connections(source)
+            native.stop()
+
+
+    async def test_closing_data_channel_viewer_preserves_other_viewer(self):
+        from app.media.gstreamer import GStreamerSource
+        try:
+            native = GStreamerSource('test', 320, 240, 24)
+        except (RuntimeError, OSError) as error:
+            self.skipTest(str(error))
+        clients = []
+        peer_ids = []
+        tracks = []
+        source = 'camera:shared-test'
+        try:
+            for _ in range(2):
+                client = RTCPeerConnection(RTCConfiguration(iceServers=[], bundlePolicy=RTCBundlePolicy.MAX_BUNDLE))
+                clients.append(client)
+                ready = asyncio.get_running_loop().create_future()
+                client.on('track', lambda track, ready=ready: ready.set_result(track))
+                client.addTransceiver('video', direction='recvonly')
+                client.createDataChannel('timing', ordered=False, maxRetransmits=0)
+                await client.setLocalDescription(await client.createOffer())
+                with patch.object(rtc, '_hardware_source', return_value=native):
+                    answer = await rtc.handle_offer(source, client.localDescription.sdp, 'offer')
+                peer_ids.append(answer['peer_id'])
+                await client.setRemoteDescription(RTCSessionDescription(sdp=answer['sdp'], type='answer'))
+                track = await asyncio.wait_for(ready, 5)
+                await asyncio.wait_for(track.recv(), 10)
+                tracks.append(track)
+            await clients[0].close()
+            await rtc.close_peer_connection(source, peer_ids[0])
+            await asyncio.sleep(0.5)
+            status = await asyncio.to_thread(native.status)
+            self.assertTrue(status['active'])
+            self.assertEqual(status['peers'], [peer_ids[1]])
+            self.assertEqual(clients[1].connectionState, 'connected')
+            self.assertEqual((await asyncio.wait_for(tracks[1].recv(), 5)).width, 320)
+        finally:
+            for client in clients:
+                await client.close()
+            await rtc.close_all_connections(source)
+            native.stop()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,63 @@ uv run main.py
 
 For the dashboard devs, use the URL `http://<IP-Addr>:6767/<endpoint>`
 
+## Camera video
+
+The dashboard uses H.264 over WebRTC UDP. GStreamer captures and encodes each
+physical camera once, then shares its encoded stream with up to five viewers.
+MJPEG and JPEG-over-WebSocket playback routes have been removed. HTTP handles
+camera controls, still images, and SDP signaling, not video frames.
+
+Install the native packages on the onboard Ubuntu computer before starting video:
+
+```sh
+sudo apt install python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+  gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-nice v4l-utils
+```
+
+The media worker runs with `/usr/bin/python3`, independently of the API virtual
+environment. Set `GSTREAMER_PYTHON` if the native bindings use a different Python.
+Use `GST_PLUGIN_PATH` for an explicit custom plugin installation. GStreamer 1.20
+on Ubuntu 22.04 is the tested baseline.
+
+Select **Kreo Owl** in the dashboard and click **Start**. Detection uses its stable
+`/dev/v4l/by-id/` path. The 720p60 mode uses MJPEG USB capture, x264 `ultrafast`,
+`tune=zerolatency`, no B-frames or lookahead, a one-frame leaky queue, a one-second
+keyframe interval, and a 6 Mb/s target. Other cameras use their advertised rates.
+The worker temporarily disables dynamic frame-rate reduction above 30 FPS and
+restores its previous setting on shutdown. The browser must support H.264.
+
+Closing a viewer releases that peer. **Stop** stops the shared camera and all of
+its viewers. A camera already shared at another mode returns HTTP 409 rather than
+silently changing other viewers' capture settings. Change its mode after stopping
+the camera. Still-image capture reuses the current camera buffer.
+
+The displayed latency matches source-buffer delivery timestamps to browser video
+presentation callbacks using RTP timestamps. Clock probes use the peer's data
+channel. The value excludes camera exposure, camera-internal buffering, and screen
+scanout. It is an estimate, not a camera-to-screen measurement. Video continues if
+the browser does not support the timestamp callbacks.
+
+Before the final local cleanup, a Kreo dashboard run delivered about 60 FPS and
+measured 38 ms median source-buffer-to-browser delay over 30 seconds. This is a
+historical observation, not a guarantee for the final build. Deployment, physical
+camera reconnection, fullscreen sharing, and final latency measurements must be
+rechecked on the rover after the coordinated UI and API update. The original
+onboard API has not been replaced by this change.
+
+For local validation with native GStreamer installed:
+
+```sh
+uv sync --group test
+uv run --group test python -m unittest discover -s tests
+```
+
+The `test` group includes aiortc only as a real ICE/RTP test receiver. It is no
+longer the runtime video encoder. Hardware-free tests use native test video when
+available, and report a skip when native dependencies are missing.
+
 
 ## ROS2 Integration
 

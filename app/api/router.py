@@ -12,7 +12,6 @@ from app.api.navigation import (
 # Import all module routers
 from app.api.navigation import (
     camera,
-    camera_ws,
     camera_webrtc,
     report,
     ros_nav,
@@ -26,7 +25,7 @@ from app.api.others import teensy, test
 from app.api.science import available as sci_available
 from app.api.science import report as sci_reports
 from app.api.science import sensor_data as sci_sensor_data
-from app.api.science import microscope, microscope_ws
+from app.api.science import microscope
 from app.api.science import microscope_webrtc
 from app.api.science import control as sci_control
 from app.api.science import drill_data as sci_drill_data
@@ -36,9 +35,6 @@ router = APIRouter()
 
 # Navigation endpoints -> /api/nav/
 router.include_router(camera.router, prefix="/api/nav", tags=["navigation"])
-router.include_router(
-    camera_ws.router, prefix="/api/nav", tags=["navigation", "websocket"]
-)
 router.include_router(report.router, prefix="/api/nav", tags=["navigation"])
 router.include_router(nav_available.router, prefix="/api/nav", tags=["navigation"])
 router.include_router(ros_nav.router, prefix="/api/nav", tags=["navigation", "ros"])
@@ -72,9 +68,6 @@ router.include_router(
 )
 router.include_router(
     microscope.router, prefix="/api/sci", tags=["science", "microscope"]
-)
-router.include_router(
-    microscope_ws.router, prefix="/api/sci", tags=["science", "microscope", "websocket"]
 )
 router.include_router(
     microscope_webrtc.router,
