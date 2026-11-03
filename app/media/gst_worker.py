@@ -124,11 +124,18 @@ def remove_peer(peer_id):
         return False
     if peer.get('pending') is not None:
         reply(peer['pending'], error='Viewer closed during negotiation')
+    # Native callbacks capture this peer and otherwise retain its RTC resources.
+    for obj, handler in peer['handlers']:
+        obj.disconnect(handler)
+    for pad, probe in peer['probes']:
+        pad.remove_probe(probe)
     tee_pad = peer['tee_pad']
     tee_pad.unlink(peer['bin'].get_static_pad('sink'))
     pipeline.get_by_name('encoded').release_request_pad(tee_pad)
     peer['bin'].set_state(Gst.State.NULL)
     pipeline.remove(peer['bin'])
+    peer['handlers'].clear()
+    peer['probes'].clear()
     return True
 
 def maybe_answer(peer):
@@ -166,8 +173,11 @@ def add_peer(request):
             f'application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload={payload}'))
     pipeline.add(branch)
     tee_pad = pipeline.get_by_name('encoded').request_pad_simple('src_%u')
-    peer = {'bin':branch, 'rtc':rtc, 'tee_pad':tee_pad, 'pending':request['id'], 'times':deque(maxlen=240), 'started':time.monotonic()}
+    peer = {'bin':branch, 'rtc':rtc, 'tee_pad':tee_pad, 'pending':request['id'], 'times':deque(maxlen=240), 'started':time.monotonic(), 'handlers':[], 'probes':[]}
     peers[peer_id] = peer
+    # Activate the branch before live buffers can reach its sink pad. Linking
+    # an inactive pad can return FLUSHING and stop the shared source task.
+    branch.sync_state_with_parent()
     if tee_pad.link(branch.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
         remove_peer(peer_id)
         raise RuntimeError('Unable to link viewer to shared H.264 encoder')
@@ -184,13 +194,14 @@ def add_peer(request):
                     if capture_ns:
                         peer['times'].append([struct.unpack_from('!I', header, 4)[0], capture_ns / 1e6])
         return Gst.PadProbeReturn.OK
-    branch.get_by_name('pay').get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, packets)
-    rtc.connect('notify::ice-gathering-state', lambda *_: GLib.idle_add(lambda: (maybe_answer(peer), False)[1]))
+    pay_pad = branch.get_by_name('pay').get_static_pad('src')
+    peer['probes'].append((pay_pad, pay_pad.add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, packets)))
+    peer['handlers'].append((rtc, rtc.connect('notify::ice-gathering-state', lambda *_: GLib.idle_add(lambda: (maybe_answer(peer), False)[1]))))
     def connection_changed(*_):
         state = rtc.get_property('connection-state')
         if state in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED):
             GLib.idle_add(lambda: (remove_peer(peer_id), False)[1])
-    rtc.connect('notify::connection-state', connection_changed)
+    peer['handlers'].append((rtc, rtc.connect('notify::connection-state', connection_changed)))
     def data_channel(_rtc, channel):
         if channel.get_property('label') != 'timing':
             channel.emit('close')
@@ -208,9 +219,8 @@ def add_peer(request):
                     'frames':list(peer['times']) if data.get('include_frames') else [], 'server_send_ms':time.time_ns()/1e6}))
             except (KeyError, ValueError, TypeError):
                 return
-        channel.connect('on-message-string', message)
-    rtc.connect('on-data-channel', data_channel)
-    branch.sync_state_with_parent()
+        peer['handlers'].append((channel, channel.connect('on-message-string', message)))
+    peer['handlers'].append((rtc, rtc.connect('on-data-channel', data_channel)))
     status, msg = GstSdp.SDPMessage.new_from_text(request['sdp'])
     if status != GstSdp.SDPResult.OK:
         raise ValueError('Invalid SDP')

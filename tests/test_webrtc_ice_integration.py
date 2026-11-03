@@ -3,6 +3,7 @@
 Run: python -m unittest discover -s tests -p test_webrtc_ice_integration.py
 """
 import asyncio
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -87,6 +88,45 @@ class IceIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             for client in clients:
                 await client.close()
+            await rtc.close_all_connections(source)
+            native.stop()
+
+
+    async def test_shared_encoder_delivers_after_last_viewer_reconnects(self):
+        from app.media.gstreamer import GStreamerSource
+        try:
+            native = GStreamerSource('test', 320, 240, 24)
+        except (RuntimeError, OSError) as error:
+            self.skipTest(str(error))
+        source = 'camera:reconnect-test'
+        descriptor_counts = []
+        try:
+            for _ in range(5):
+                client = RTCPeerConnection(RTCConfiguration(iceServers=[], bundlePolicy=RTCBundlePolicy.MAX_BUNDLE))
+                ready = asyncio.get_running_loop().create_future()
+                client.on('track', lambda track, ready=ready: ready.set_result(track))
+                client.addTransceiver('video', direction='recvonly')
+                client.createDataChannel('timing', ordered=False, maxRetransmits=0)
+                try:
+                    await client.setLocalDescription(await client.createOffer())
+                    with patch.object(rtc, '_hardware_source', return_value=native):
+                        answer = await rtc.handle_offer(source, client.localDescription.sdp, 'offer')
+                    await client.setRemoteDescription(RTCSessionDescription(sdp=answer['sdp'], type='answer'))
+                    track = await asyncio.wait_for(ready, 5)
+                    frames = [await asyncio.wait_for(track.recv(), 5) for _ in range(3)]
+                    self.assertTrue(all(frame.width == 320 for frame in frames))
+                finally:
+                    await client.close()
+                    await rtc.close_all_connections(source)
+                self.assertTrue(native.status()['active'])
+                await asyncio.sleep(0.1)
+                descriptors = Path(f'/proc/{native.process.pid}/fd')
+                if descriptors.exists():
+                    descriptor_counts.append(len(list(descriptors.iterdir())))
+            if descriptor_counts:
+                self.assertLessEqual(descriptor_counts[-1], descriptor_counts[0] + 8,
+                                     f'Closed viewers retained file descriptors: {descriptor_counts}')
+        finally:
             await rtc.close_all_connections(source)
             native.stop()
 
