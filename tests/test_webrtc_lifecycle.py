@@ -48,6 +48,7 @@ class WebRTCLifecycleTests(unittest.IsolatedAsyncioTestCase):
         return await rtc.handle_offer(name, 'offer', 'offer')
     async def test_one_viewer_closes_without_stopping_shared_encoder(self):
         a,b = await asyncio.gather(self.offer(),self.offer())
+        self.assertIsNotNone(rtc._source_reaper)
         self.assertEqual(a['target_fps'],60)
         self.assertEqual(a['codec'],'H264')
         self.assertFalse(a['adaptive_quality'])
@@ -98,6 +99,28 @@ class WebRTCLifecycleTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await starting
+        self.assertTrue(self.source.stopped)
+        self.assertEqual(rtc._sources, {})
+
+    async def test_cancel_before_reservation_still_reclaims_registered_ros_source(self):
+        entered, never, allow_reap = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def prune(source):
+            if not entered.is_set():
+                entered.set()
+                await never.wait()
+            return set()
+        async def wait_for_reap(_delay):
+            await allow_reap.wait()
+        frame = Mock(shape=(240, 320, 3))
+        with patch.object(rtc, '_start_ros_source', new=AsyncMock(return_value=self.source)), patch.object(rtc, '_prune', side_effect=prune), patch.object(rtc.asyncio, 'sleep', side_effect=wait_for_reap):
+            starting = asyncio.create_task(rtc.handle_offer('ros_camera:test', 'offer', 'offer', lambda: frame))
+            await asyncio.wait_for(entered.wait(), 2)
+            starting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await starting
+            self.assertIsNotNone(rtc._source_reaper)
+            allow_reap.set()
+            await asyncio.wait_for(rtc._source_reaper, 2)
         self.assertTrue(self.source.stopped)
         self.assertEqual(rtc._sources, {})
 

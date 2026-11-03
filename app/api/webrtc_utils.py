@@ -12,6 +12,12 @@ _source_reaper = None
 _pc_lock = asyncio.Lock()
 
 
+def _ensure_reaper():
+    global _source_reaper
+    if _source_reaper is None or _source_reaper.done():
+        _source_reaper = asyncio.create_task(_reap_sources())
+
+
 async def _reap_sources():
     """Reclaim crashed or abandoned ROS sources even when a browser never sends DELETE."""
     global _source_reaper
@@ -67,7 +73,6 @@ def _hardware_source(source_name):
 
 
 async def handle_offer(source_name, sdp, sdp_type, capture_fn=None, fps=60):
-    global _source_reaper
     if sdp_type != 'offer':
         raise RuntimeError('Expected an SDP offer')
     peer_id = uuid4().hex
@@ -81,6 +86,8 @@ async def handle_offer(source_name, sdp, sdp_type, capture_fn=None, fps=60):
                 height, width = frame.shape[:2]
                 source = await _start_ros_source(capture_fn, width, height, fps)
                 _sources[source_name] = source
+            # A ROS encoder is ours before the first viewer is reserved.
+            _ensure_reaper()
         else:
             source = await asyncio.to_thread(_hardware_source, source_name)
         # Worker enforces the limit across aliases of the same physical camera.
@@ -90,8 +97,7 @@ async def handle_offer(source_name, sdp, sdp_type, capture_fn=None, fps=60):
             raise ValueError('Maximum of five viewers reached')
         _peer_connections.setdefault(source_name, {})[peer_id] = source
         _pending_peers.add(peer_id)
-        if _source_reaper is None or _source_reaper.done():
-            _source_reaper = asyncio.create_task(_reap_sources())
+        _ensure_reaper()
     try:
         answer = await asyncio.to_thread(source.request, 'offer', peer_id=peer_id, sdp=sdp)
         return {**answer, 'peer_id':peer_id, 'adaptive_quality':False,

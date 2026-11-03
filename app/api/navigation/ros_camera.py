@@ -107,6 +107,9 @@ async def unsubscribe_from_camera(request: SubscribeCameraRequest):
         )
 
     topic_name = request.topic_name or CAMERA_COLOR_IMAGE_RAW_TOPIC
+    from app.api.webrtc_utils import get_connection_count
+    if await get_connection_count(f'ros_camera:{topic_name}'):
+        raise HTTPException(409, 'ROS camera still has active viewers. Close them before unsubscribing.')
     ros_manager.unsubscribe(topic_name)
 
     return {

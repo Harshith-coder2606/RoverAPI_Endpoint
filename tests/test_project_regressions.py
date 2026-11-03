@@ -33,6 +33,16 @@ def application():
     return app
 
 
+class RosSubscriptionTests(unittest.TestCase):
+    def test_unsubscribe_cannot_remove_a_topic_used_by_another_viewer(self):
+        app = FastAPI()
+        app.include_router(ros_camera.router)
+        with patch.object(ros_camera.ros_manager, 'is_connected', True), patch.object(ros_camera.ros_manager, 'unsubscribe') as unsubscribe, patch('app.api.webrtc_utils.get_connection_count', new=AsyncMock(return_value=1)):
+            response = TestClient(app).post('/ros/camera/unsubscribe', json={'topic_name': '/custom/image'})
+            self.assertEqual(response.status_code, 409)
+            unsubscribe.assert_not_called()
+
+
 class StorageRouteTests(unittest.TestCase):
     def test_waypoint_routes_keep_concurrent_ids_and_names_unique(self):
         with TemporaryDirectory() as directory, patch.object(camera, "WAYPOINT_FILE", str(Path(directory) / "waypoints.json")):
