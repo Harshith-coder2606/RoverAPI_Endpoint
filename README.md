@@ -55,12 +55,30 @@ channel. The value excludes camera exposure, camera-internal buffering, and scre
 scanout. It is an estimate, not a camera-to-screen measurement. Video continues if
 the browser does not support the timestamp callbacks.
 
-Before the final local cleanup, a Kreo dashboard run delivered about 60 FPS and
-measured 38 ms median source-buffer-to-browser delay over 30 seconds. This is a
-historical observation, not a guarantee for the final build. Deployment, physical
-camera reconnection, fullscreen sharing, and final latency measurements must be
-rechecked on the rover after the coordinated UI and API update. The original
-onboard API has not been replaced by this change.
+Hardware validation on 3 November 2026 used the Kreo Owl at 1280×720, nominal
+60 FPS, and 6 Mb/s. A 30-second steady dashboard run measured 35.4 ms median and
+37.5 ms p95 source-buffer-to-browser delay. A run after repeated view changes
+measured 45.9 ms median and 77.6 ms p95. The clock-probe half RTT was about
+1.3–1.4 ms. These runs reported no RTP packet loss, decoded-frame drops, or
+freezes. They do not establish exposure-to-screen latency.
+
+Four fullscreen entry/exit cycles at 480p retained one viewer and the existing
+capture mode. Five transitions during delayed offer responses reclaimed their
+late peers. A Kreo snapshot saved successfully. Two synthetic ROS image viewers
+also shared a topic through the onboard rosbridge; closing one preserved the
+other, and global unsubscribe returned HTTP 409 until both closed. Physical
+microscope and camera/IMU motion tests remain unverified.
+
+The onboard `uv.service` now runs release
+`a4794dcaae0022a793b0b83ae53cc647c1b30856` from
+`~/.local/share/rover-api/releases/` on port 6767. Its storage directory links to
+the existing checkout's storage. The previous checkout and its local edits are
+preserved. The service override is
+`/etc/systemd/system/uv.service.d/20-h264.conf`; the original service description
+and checkout diff are saved under
+`~/.local/share/rover-api/deployment-20261103/`. To return to the original service,
+remove that override, run `sudo systemctl daemon-reload`, then
+`sudo systemctl restart uv.service`.
 
 For local validation with native GStreamer installed:
 
