@@ -85,6 +85,10 @@ and checkout diff are saved under
 remove that override, run `sudo systemctl daemon-reload`, then
 `sudo systemctl restart uv.service`.
 
+Rolling-shutter ("jello") correction can be enabled per camera; it runs on the
+rover before encoding, using the BNO055 gyro or the video's own optical flow. See
+[README_ROLLING_SHUTTER.md](README_ROLLING_SHUTTER.md).
+
 For local validation with native GStreamer installed:
 
 ```sh
