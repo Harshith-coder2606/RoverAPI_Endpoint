@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import cv2
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -428,6 +428,8 @@ class DejelloRequest(BaseModel):
     readout_ms: Optional[float] = Field(None, ge=0, le=100)
     reset_readout: bool = False
     reset_calibration: bool = False
+    # imu: gyro via calibration; video: optical flow only, no IMU; auto: imu when calibrated, else video
+    source: Optional[Literal["auto", "imu", "video"]] = None
 
 
 def _dejello_source(camera_name: str):
@@ -454,7 +456,7 @@ def configure_dejello(camera_name: str, request: DejelloRequest):
     readout = None if request.reset_readout else (request.readout_ms if request.readout_ms is not None else "keep")
     try:
         return {"status": "ok", "dejello": _dejello_source(camera_name).dejello(
-            enabled=request.enabled, readout_ms=readout, reset=request.reset_calibration)}
+            enabled=request.enabled, readout_ms=readout, reset=request.reset_calibration, source=request.source)}
     except (RuntimeError, ValueError, TimeoutError) as exc:
         raise HTTPException(409, str(exc)) from exc
 

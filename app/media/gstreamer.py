@@ -132,7 +132,7 @@ class GStreamerSource:
     def _forward_imu(self, sample):
         self._send('imu', samples=[sample])
 
-    def dejello(self, enabled=None, readout_ms='keep', reset=False):
+    def dejello(self, enabled=None, readout_ms='keep', reset=False, source=None):
         """Configure IMU rolling-shutter correction; gyro samples flow only while it is enabled."""
         from app.media.imu_relay import relay
         values = {'reset': reset}
@@ -140,6 +140,8 @@ class GStreamerSource:
             values['enabled'] = enabled
         if readout_ms != 'keep':
             values['readout_ms'] = readout_ms
+        if source is not None:
+            values['source'] = source
         result = self.request('dejello', timeout=5, **values)
         if result.get('enabled') and not self._imu_forwarding:
             relay.add(self._forward_imu)

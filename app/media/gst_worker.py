@@ -317,7 +317,8 @@ def command(request):
             if not dejello:
                 raise ValueError('IMU rolling-shutter correction is not available for this camera')
             readout = request.get('readout_ms', 'keep')
-            result = dejello.configure(enabled=request.get('enabled'), readout_ms=readout, reset=bool(request.get('reset')))
+            result = dejello.configure(enabled=request.get('enabled'), readout_ms=readout, reset=bool(request.get('reset')),
+                                       source=request.get('source'))
         elif cmd == 'timing':
             peer = peers.get(request['peer_id'])
             result = {'frames':list(peer['times']) if peer else [], 'server_ms':time.time_ns()/1e6}

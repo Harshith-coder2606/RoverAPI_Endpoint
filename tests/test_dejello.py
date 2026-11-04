@@ -152,12 +152,12 @@ def test_row_warp_scales_with_resolution():
     assert source_position((0, 0, 0), 10, 20, 1280, 720) == (10, 20)
 
 
-def test_dejello_corrects_only_with_calibration_and_fresh_gyro(tmp_path):
+def test_imu_source_corrects_only_with_calibration_and_fresh_gyro(tmp_path):
     d = Dejello(640, 360, 30, str(tmp_path / 'cal.json'))
     try:
         y = texture(640, 360); u = v = np.full((180, 320), 128, np.uint8)
         assert d.process([y, u, v], 5000.0) is None  # disabled
-        d.configure(enabled=True)
+        d.configure(enabled=True, source='imu')
         assert d.process([y, u, v], 5000.0) is None  # not calibrated
         d.calibration = {'version': 1, 'gain': [[0, -900, 0], [700, 0, 0], [0, 0, 0]], 'offset_ms': -40, 'readout_ms': 20,
                          'readout_fitted': True, 'roll_fitted': False, 'fit': .9, 'samples': 100, 'width': 640, 'height': 360}
@@ -218,3 +218,52 @@ def test_pooled_strips_match_sequential():
             b = r.apply([y, u, u.copy()], warp, pool)
             for pa, pb in zip(a, b):
                 assert np.abs(pa.astype(int) - pb).max() <= 2  # strip splits differ only by rounding
+
+
+def test_video_source_corrects_a_rolling_shutter_pan_without_imu(tmp_path):
+    width, height, fps, readout_ms, speed = 640, 360, 15, 40.0, 240.0  # content moves 240 px/s
+    scene = texture(1600, 520, seed=11)
+    oy = 80
+
+    def frame(t, rolling):
+        ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+        s = ys / height - 0.5 if rolling else 0.0
+        sx = xs + 400 - speed * (t + s * readout_ms / 1000)   # row y is exposed at t + s * readout
+        return cv2.remap(scene, sx.astype(np.float32), (ys + oy).astype(np.float32), cv2.INTER_LINEAR)
+
+    d = Dejello(width, height, fps, str(tmp_path / 'cal.json'))
+    try:
+        d.configure(enabled=True, source='video', readout_ms=readout_ms)
+        chroma = np.full((height // 2, width // 2), 128, np.uint8)
+        before, after = [], []
+        for k in range(10):
+            t = k / fps
+            captured, ideal = frame(t, True), frame(t, False)
+            out = d.process([captured, chroma, chroma.copy()], t * 1000)
+            if k >= 3:  # tracker seeded and velocity extrapolation primed
+                assert out is not None and d.status()['active_source'] == 'video'
+                inner = (slice(30, -30), slice(60, -60))
+                before.append(np.abs(captured[inner].astype(int) - ideal[inner]).mean())
+                after.append(np.abs(out[0][inner].astype(int) - ideal[inner]).mean())
+        assert np.mean(after) < 0.35 * np.mean(before), (np.mean(before), np.mean(after))
+        # Expected shear: speed * readout = 9.6 px across the frame.
+        assert 7 < d.stats['warp_px'] < 12
+    finally:
+        d.stop()
+
+
+def test_auto_source_uses_video_until_imu_is_calibrated(tmp_path):
+    d = Dejello(640, 360, 30, str(tmp_path / 'cal.json'))
+    try:
+        with pytest.raises(ValueError):
+            d.configure(source='gyro')
+        d.configure(enabled=True)
+        y = texture(640, 360); c = np.full((180, 320), 128, np.uint8)
+        d.process([y, c, c.copy()], 1000.0)
+        assert d.status()['source'] == 'auto' and d.status()['active_source'] is None  # first frame only seeds flow
+        d.calibration = {'version': 1, 'gain': [[0, -900, 0], [700, 0, 0], [0, 0, 0]], 'offset_ms': -40, 'readout_ms': 20,
+                         'readout_fitted': True, 'roll_fitted': False, 'fit': .9, 'samples': 100, 'width': 640, 'height': 360}
+        d.add_gyro([[900 + i * 33, 0.0, 0.2, 0.0] for i in range(8)])
+        assert d.process([y, c, c.copy()], 1033.0) is not None and d.status()['active_source'] == 'imu'
+    finally:
+        d.stop()

@@ -493,8 +493,20 @@ class Remapper:
 
 
 # --------------------------------------------------------------- orchestration
+SOURCES = ('auto', 'imu', 'video')
+MAX_VIDEO_WARP_PX = 80      # beyond this, video-only flow is more likely wrong than the shear is real
+MAX_VIDEO_ROLL = 0.05
+
+
 class Dejello:
-    """Per-camera state: gyro history, calibration (flow + gyro), and live correction."""
+    """Per-camera state: gyro history, calibration (flow + gyro), and live correction.
+
+    Motion source per frame:
+      imu    gyro rate through the flow+gyro calibration (needs the IMU rigidly on the camera body)
+      video  image velocity from optical flow on the frames themselves, no IMU at all; it lags the
+             motion by about half a frame and is fooled by large moving objects or parallax
+      auto   imu when calibrated and gyro data is current, otherwise video
+    """
 
     def __init__(self, width, height, fps, state_path=None):
         self.width, self.height, self.fps = width, height, fps
@@ -504,8 +516,15 @@ class Dejello:
         # Strip warps run on our own pool; OpenCV's internal pool costs ~0.3 ms per call to wake.
         cv2.setNumThreads(1)
         self.pool = ThreadPoolExecutor(8, thread_name_prefix='dejello-warp')
-        self.tracker = FlowTracker()
+        self.tracker = FlowTracker()          # calibration flow, flow thread
+        self.sync_tracker = FlowTracker()     # video-source flow, streaming thread
         self.video_readout = VideoReadoutEstimator()
+        self.video_readout_last = None
+        self.source = 'auto'
+        self.active_source = None
+        self.obs_queue = deque(maxlen=256)
+        self.sync_previous = None             # (capture_ms, observation) of the last synchronous flow
+        self.video_velocity = None
         self.observations = deque(maxlen=900)
         self.enabled = False
         self.readout_override = None
@@ -517,7 +536,8 @@ class Dejello:
         self.stopped = False
         self.last_flow_capture = None
         self.since_fit = 0
-        self.stats = {'frames': 0, 'corrected': 0, 'no_gyro': 0, 'warp_px': 0.0, 'correct_ms': 0.0, 'flow_ms': 0.0}
+        self.stats = {'frames': 0, 'corrected': 0, 'no_gyro': 0, 'no_flow': 0, 'warp_px': 0.0,
+                      'correct_ms': 0.0, 'flow_ms': 0.0, 'video_flow_ms': 0.0}
         self.thread = threading.Thread(target=self._flow_loop, daemon=True, name='dejello-flow')
         self.thread.start()
 
@@ -547,12 +567,18 @@ class Dejello:
         for t, x, y, z in samples:
             self.gyro.add(float(t), float(x), float(y), float(z))
 
-    def configure(self, enabled=None, readout_ms='keep', reset=False):
+    def configure(self, enabled=None, readout_ms='keep', reset=False, source=None):
         with self.lock:
+            if source is not None:
+                if source not in SOURCES:
+                    raise ValueError('source must be one of ' + ', '.join(SOURCES))
+                self.source = source
             if enabled is not None:
                 self.enabled = bool(enabled)
                 if not self.enabled:
                     self.tracker.reset()
+                    self.sync_tracker.reset()
+                    self.sync_previous = self.video_velocity = None
             if readout_ms != 'keep':
                 self.readout_override = None if readout_ms is None else max(0.0, min(self.max_readout_ms, float(readout_ms)))
             if reset:
@@ -560,6 +586,7 @@ class Dejello:
                 self.last_fit = None
                 self.observations.clear()
                 self.video_readout.reset()
+                self.video_readout_last = None
                 if self.state_path:
                     try:
                         os.remove(self.state_path)
@@ -578,7 +605,10 @@ class Dejello:
             return self.calibration['readout_ms'], 'fitted'
         video = self.video_readout.estimate()
         if video:
-            return min(self.max_readout_ms, video['readout_ms']), 'video'
+            self.video_readout_last = video
+        # Keep the last good estimate: it drops out whenever recent motion was too uniform to measure.
+        if self.video_readout_last:
+            return min(self.max_readout_ms, self.video_readout_last['readout_ms']), 'video'
         # Webcams at their configured rate usually read out over most of the frame period.
         return 0.8 * self.max_readout_ms, 'estimated'
 
@@ -588,26 +618,38 @@ class Dejello:
         if not self.enabled:
             return None
         self.stats['frames'] += 1
-        # Flow at <= 15 fps, on the raw frame, off the streaming thread.
-        if capture_ms is not None and (self.last_flow_capture is None or capture_ms - self.last_flow_capture >= 1000 / 15 * 0.9
-                                       or capture_ms < self.last_flow_capture):
-            small = cv2.resize(planes[0], (FLOW_W, FLOW_H), interpolation=cv2.INTER_AREA)
-            self.pending = (small, capture_ms)
-            self.last_flow_capture = capture_ms
-            self.wake.set()
         cal = self.calibration
-        if cal is None or capture_ms is None:
+        rate = None
+        if cal is not None and capture_ms is not None and self.source != 'video':
+            readout, _ = self.readout()
+            mid = capture_ms + cal['offset_ms']
+            half = max(5.0, readout / 2)
+            rate = self.gyro.mean_rate(mid - half, mid + half)
+        use_video = self.source == 'video' or (self.source == 'auto' and rate is None)
+
+        if use_video:
+            warp = self._video_warp(planes[0], capture_ms)
+        else:
+            # Calibration flow at <= 15 fps, on the raw frame, off the streaming thread.
+            if capture_ms is not None and (self.last_flow_capture is None or capture_ms - self.last_flow_capture >= 1000 / 15 * 0.9
+                                           or capture_ms < self.last_flow_capture):
+                small = cv2.resize(planes[0], (FLOW_W, FLOW_H), interpolation=cv2.INTER_AREA)
+                self.pending = (small, capture_ms)
+                self.last_flow_capture = capture_ms
+                self.wake.set()
+            if rate is None:
+                # Never apply a stale shear; show the frame as captured.
+                if cal is not None:
+                    self.stats['no_gyro'] += 1
+                self.active_source = None
+                return None
+            readout, _ = self.readout()
+            warp = row_warp(cal, rate, self.width, self.height, readout)
+            self.active_source = 'imu'
+        if warp is None:
+            self.active_source = None
             return None
         started = time.perf_counter()
-        readout, _ = self.readout()
-        mid = capture_ms + cal['offset_ms']
-        half = max(5.0, readout / 2)
-        rate = self.gyro.mean_rate(mid - half, mid + half)
-        if rate is None:
-            # Never apply a stale shear; show the frame as captured.
-            self.stats['no_gyro'] += 1
-            return None
-        warp = row_warp(cal, rate, self.width, self.height, readout)
         out = self.remapper.apply(planes, warp, self.pool)
         self.stats['corrected'] += 1
         self.stats['warp_px'] = max(self.stats['warp_px'] * 0.98, math.hypot(warp[0], warp[1]))
@@ -615,12 +657,60 @@ class Dejello:
         self.stats['correct_ms'] = elapsed if not self.stats['correct_ms'] else 0.9 * self.stats['correct_ms'] + 0.1 * elapsed
         return out
 
+    def _video_warp(self, luma, capture_ms):
+        """Warp from the image's own motion: velocity = flow / interval, displacement over readout."""
+        if capture_ms is None:
+            return None
+        previous = self.sync_previous
+        # Above ~30 fps, track every other frame and reuse the latest velocity.
+        if previous is not None and 0 < capture_ms - previous[0] < 30 and self.video_velocity is not None:
+            self.active_source = 'video'
+            return self._velocity_warp(self.video_velocity)
+        started = time.perf_counter()
+        if previous is not None and not 0 < capture_ms - previous[0] <= 500:
+            self.sync_tracker.reset()
+            previous = None
+        small = cv2.resize(luma, (FLOW_W, FLOW_H), interpolation=cv2.INTER_AREA)
+        rows = self.sync_tracker.track(small)
+        interval = capture_ms - previous[0] if previous is not None else 0
+        o = observe(rows, self.width, self.height, capture_ms, interval, self.sync_tracker.frame)
+        elapsed = (time.perf_counter() - started) * 1000
+        self.stats['video_flow_ms'] = elapsed if not self.stats['video_flow_ms'] else 0.9 * self.stats['video_flow_ms'] + 0.1 * elapsed
+        self.sync_previous = (capture_ms, o)
+        if o is None or o['n'] < 30:
+            self.stats['no_flow'] += 1
+            self.video_velocity = None
+            return None
+        self.obs_queue.append(o)   # readout and calibration bookkeeping happen on the flow thread
+        self.wake.set()
+        per_second = lambda ob: [ob['dx'] * 1000 / ob['interval_ms'], ob['dy'] * 1000 / ob['interval_ms'],
+                                 ob['roll'] * 1000 / ob['interval_ms']]
+        velocity = per_second(o)
+        last = previous[1] if previous is not None else None
+        if last is not None and last['frame'] + 1 == o['frame']:
+            # Flow k-1 -> k is centred half a frame back; extrapolate to this frame.
+            velocity = [v + 0.5 * (v - b) for v, b in zip(velocity, per_second(last))]
+        self.video_velocity = velocity
+        self.active_source = 'video'
+        return self._velocity_warp(velocity)
+
+    def _velocity_warp(self, velocity):
+        readout, _ = self.readout()
+        seconds = readout / 1000
+        vx, vy, vroll = (v * seconds for v in velocity)
+        size = math.hypot(vx, vy)
+        if size > MAX_VIDEO_WARP_PX:
+            vx, vy = vx * MAX_VIDEO_WARP_PX / size, vy * MAX_VIDEO_WARP_PX / size
+        return vx, vy, max(-MAX_VIDEO_ROLL, min(MAX_VIDEO_ROLL, vroll))
+
     # --- flow + calibration thread
     def _flow_loop(self):
         previous = None
         while not self.stopped:
             self.wake.wait(0.5)
             self.wake.clear()
+            while self.obs_queue:
+                self._record(self.obs_queue.popleft())
             job, self.pending = self.pending, None
             if job is None or not self.enabled:
                 if not self.enabled:
@@ -636,19 +726,22 @@ class Dejello:
             o = observe(rows, self.width, self.height, capture_ms, interval, self.tracker.frame)
             elapsed = (time.perf_counter() - started) * 1000
             self.stats['flow_ms'] = elapsed if not self.stats['flow_ms'] else 0.9 * self.stats['flow_ms'] + 0.1 * elapsed
-            if o is None:
-                continue
-            self.video_readout.add(o)
-            self.observations.append(o)
-            self.since_fit += 1
-            if self.since_fit >= 30:
-                self.since_fit = 0
-                fit = fit_calibration(list(self.observations), self.gyro, self.width, self.height, self.max_readout_ms)
-                self.last_fit = fit
-                # One poor window must not replace a good stored calibration.
-                if fit['ok'] and (self.calibration is None or fit['calibration']['fit'] >= self.calibration['fit'] - 0.05):
-                    self.calibration = fit['calibration']
-                    self._save()
+            if o is not None:
+                self._record(o)
+
+    def _record(self, o):
+        """Readout estimate and IMU calibration bookkeeping for one flow observation (flow thread)."""
+        self.video_readout.add(o)
+        self.observations.append(o)
+        self.since_fit += 1
+        if self.since_fit >= 30:
+            self.since_fit = 0
+            fit = fit_calibration(list(self.observations), self.gyro, self.width, self.height, self.max_readout_ms)
+            self.last_fit = fit
+            # One poor window must not replace a good stored calibration.
+            if fit['ok'] and (self.calibration is None or fit['calibration']['fit'] >= self.calibration['fit'] - 0.05):
+                self.calibration = fit['calibration']
+                self._save()
 
     def stop(self):
         self.stopped = True
@@ -662,6 +755,8 @@ class Dejello:
         fit = self.last_fit
         return {
             'enabled': self.enabled,
+            'source': self.source,
+            'active_source': self.active_source,
             'calibrated': self.calibration is not None,
             'calibration': self.calibration,
             'last_fit': None if fit is None else {k: v for k, v in fit.items() if k != 'calibration'},
