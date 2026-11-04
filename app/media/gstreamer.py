@@ -13,6 +13,8 @@ import time
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+# Per-camera rolling-shutter calibrations stay on this computer.
+DEJELLO_DIR = Path(os.environ.get('ROVER_DEJELLO_DIR', Path.home() / '.local/share/rover-api/dejello'))
 
 
 class GStreamerSource:
@@ -29,10 +31,13 @@ class GStreamerSource:
         self._capture_fn = capture_fn
         self._last_frame = None
         self._last_sent = None
+        self._imu_forwarding = False
         args = [os.environ.get('GSTREAMER_PYTHON', '/usr/bin/python3'), '-u',
                 str(Path(__file__).with_name('gst_worker.py')), '--device', device,
                 '--width', str(width), '--height', str(height), '--fps', str(fps),
                 '--pixel-format', pixel_format]
+        if device.startswith('/dev/') and capture_fn is None:
+            args += ['--dejello-state', str(DEJELLO_DIR / f'{Path(device).name}.json')]
         if capture_fn is not None:
             self._frame_file = tempfile.NamedTemporaryFile(prefix='rover-frame-', dir='/dev/shm')
             self._frame_file.truncate(width * height * 3)
@@ -113,6 +118,38 @@ class GStreamerSource:
                     logger.exception('Failed to release timed-out viewer')
             raise
 
+    def _send(self, cmd, **values):
+        """Fire-and-forget control message (no reply expected)."""
+        with self._lock:
+            if self.process.poll() is not None:
+                return
+            try:
+                self.process.stdin.write(json.dumps({'id': cmd, 'cmd': cmd, **values}) + '\n')
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def _forward_imu(self, sample):
+        self._send('imu', samples=[sample])
+
+    def dejello(self, enabled=None, readout_ms='keep', reset=False):
+        """Configure IMU rolling-shutter correction; gyro samples flow only while it is enabled."""
+        from app.media.imu_relay import relay
+        values = {'reset': reset}
+        if enabled is not None:
+            values['enabled'] = enabled
+        if readout_ms != 'keep':
+            values['readout_ms'] = readout_ms
+        result = self.request('dejello', timeout=5, **values)
+        if result.get('enabled') and not self._imu_forwarding:
+            relay.add(self._forward_imu)
+            self._imu_forwarding = True
+        elif not result.get('enabled') and self._imu_forwarding:
+            relay.remove(self._forward_imu)
+            self._imu_forwarding = False
+        result.pop('id', None)
+        return {**result, 'imu_relay': relay.status()}
+
     def _feed(self):
         while not self._closing.is_set():
             started = time.monotonic()
@@ -149,6 +186,10 @@ class GStreamerSource:
 
     def stop(self):
         self._closing.set()
+        if self._imu_forwarding:
+            from app.media.imu_relay import relay
+            relay.remove(self._forward_imu)
+            self._imu_forwarding = False
         if self.process.poll() is None:
             self.process.terminate()
             try:

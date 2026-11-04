@@ -16,7 +16,8 @@ import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstSdp', '1.0')
 gi.require_version('GstWebRTC', '1.0')
-from gi.repository import GLib, Gst, GstSdp, GstWebRTC
+gi.require_version('GstVideo', '1.0')
+from gi.repository import GLib, Gst, GstSdp, GstVideo, GstWebRTC
 
 Gst.init(None)
 p = argparse.ArgumentParser()
@@ -26,6 +27,7 @@ p.add_argument('--height', type=int, required=True)
 p.add_argument('--fps', type=int, required=True)
 p.add_argument('--pixel-format', default='MJPG')
 p.add_argument('--frame-file')
+p.add_argument('--dejello-state', help='Calibration file; enables IMU rolling-shutter correction support')
 a = p.parse_args()
 output_lock = threading.Lock()
 
@@ -77,8 +79,23 @@ else:
 
 if a.device in ('test', 'appsrc') or a.pixel_format != 'MJPG':
     source += 'queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! '
+
+# IMU rolling-shutter correction needs the decoded frame before encoding. The
+# pipeline is split at raw I420; frames pass through untouched while disabled.
+dejello = None
+if a.dejello_state and a.width % 2 == 0 and a.height % 2 == 0:
+    try:
+        sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent))
+        from dejello import Dejello
+        dejello = Dejello(a.width, a.height, a.fps, a.dejello_state)
+    except Exception as exc:  # numpy/OpenCV missing: stream without correction
+        print(f'IMU rolling-shutter correction unavailable: {exc}', file=sys.stderr, flush=True)
+        dejello = None
+split = ('appsink name=dejello_in emit-signals=true max-buffers=1 drop=true sync=false async=false '
+         'appsrc name=dejello_out is-live=true format=time do-timestamp=false block=false max-buffers=2 leaky-type=downstream ! '
+         if dejello else '')
 pipeline = Gst.parse_launch(source +
-    'videoconvert ! video/x-raw,format=I420 ! '
+    'videoconvert ! video/x-raw,format=I420 ! ' + split +
     f'x264enc name=encoder tune=zerolatency speed-preset=ultrafast bitrate={6000 if a.fps > 30 else 4000} '
     f'key-int-max={a.fps} bframes=0 threads=0 sliced-threads=true sync-lookahead=0 rc-lookahead=0 ! '
     'video/x-h264,profile=constrained-baseline,stream-format=byte-stream,alignment=au ! '
@@ -117,6 +134,44 @@ def save_jpeg(sink):
     return Gst.FlowReturn.OK
 if pipeline.get_by_name('snapshot'):
     pipeline.get_by_name('snapshot').connect('new-sample', save_jpeg)
+
+def corrected_frame(sink):
+    sample = sink.emit('pull-sample')
+    if not sample:
+        return Gst.FlowReturn.OK
+    out_src = pipeline.get_by_name('dejello_out')
+    caps = sample.get_caps()
+    if out_src.get_property('caps') is None or not out_src.get_property('caps').is_equal(caps):
+        out_src.set_property('caps', caps)
+    buf = sample.get_buffer()
+    if dejello.enabled:
+        info = GstVideo.VideoInfo.new_from_caps(caps)
+        capture_ns = capture_times.get(buf.pts)
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+        if ok:
+            try:
+                data = np.frombuffer(mapped.data, dtype=np.uint8)
+                dims = [(info.width, info.height), (info.width // 2, info.height // 2), (info.width // 2, info.height // 2)]
+                planes = [data[info.offset[i]:info.offset[i] + info.stride[i] * h].reshape(h, info.stride[i])[:, :w]
+                          for i, (w, h) in enumerate(dims)]
+                corrected = dejello.process(planes, capture_ns / 1e6 if capture_ns else None)
+            except Exception as exc:
+                print(f'Rolling-shutter correction skipped a frame: {exc}', file=sys.stderr, flush=True)
+                corrected = None
+            finally:
+                buf.unmap(mapped)
+            if corrected is not None:
+                out = np.zeros(info.size, dtype=np.uint8)
+                for i, (w, h) in enumerate(dims):
+                    out[info.offset[i]:info.offset[i] + info.stride[i] * h].reshape(h, info.stride[i])[:, :w] = corrected[i]
+                fixed = Gst.Buffer.new_wrapped(out.tobytes())
+                fixed.pts, fixed.dts, fixed.duration = buf.pts, buf.dts, buf.duration
+                buf = fixed
+    out_src.emit('push-buffer', buf)
+    return Gst.FlowReturn.OK
+if dejello:
+    import numpy as np
+    pipeline.get_by_name('dejello_in').connect('new-sample', corrected_frame)
 
 def remove_peer(peer_id):
     peer = peers.pop(peer_id, None)
@@ -246,12 +301,23 @@ def command(request):
         if cmd == 'offer':
             add_peer(request)
             return False
+        if cmd == 'imu':
+            # Gyro samples from the API on this computer; high rate, so never acknowledged.
+            if dejello:
+                dejello.add_gyro(request.get('samples', []))
+            return False
         if cmd == 'close':
             result = {'closed':remove_peer(request['peer_id'])}
         elif cmd == 'status':
             result = {'active':fatal_error is None and first_frame, 'error':fatal_error, 'peers':list(peers),
                       'peer_status':{key:{'state':str(peer['rtc'].get_property('connection-state')), 'recent_rtp_frames':len(peer['times'])} for key,peer in peers.items()},
-                      'fps':(len(captured)-1)*1e9/(captured[-1]-captured[0]) if len(captured)>1 else 0}
+                      'fps':(len(captured)-1)*1e9/(captured[-1]-captured[0]) if len(captured)>1 else 0,
+                      'dejello_supported':dejello is not None}
+        elif cmd == 'dejello':
+            if not dejello:
+                raise ValueError('IMU rolling-shutter correction is not available for this camera')
+            readout = request.get('readout_ms', 'keep')
+            result = dejello.configure(enabled=request.get('enabled'), readout_ms=readout, reset=bool(request.get('reset')))
         elif cmd == 'timing':
             peer = peers.get(request['peer_id'])
             result = {'frames':list(peer['times']) if peer else [], 'server_ms':time.time_ns()/1e6}
@@ -322,6 +388,8 @@ finally:
     for peer_id in list(peers):
         remove_peer(peer_id)
     pipeline.set_state(Gst.State.NULL)
+    if dejello:
+        dejello.stop()
     if frame_map:
         frame_map.close()
         frame_file.close()

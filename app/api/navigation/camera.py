@@ -10,6 +10,7 @@ from typing import Optional
 
 import cv2
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 
 from app.utils.json_store import load_json, save_json, save_json_locked
 from app.utils.expeditions import EXPEDITION_BASE_DIR, get_safe_expedition_dir
@@ -420,6 +421,42 @@ def cameras_status():
 def camera_status(camera_name: str):
     """Get specific camera status"""
     return {"status": "ok", "camera": camera_manager.get_camera_status(camera_name)}
+
+
+class DejelloRequest(BaseModel):
+    enabled: Optional[bool] = None
+    readout_ms: Optional[float] = Field(None, ge=0, le=100)
+    reset_readout: bool = False
+    reset_calibration: bool = False
+
+
+def _dejello_source(camera_name: str):
+    source = camera_manager.cameras.get(camera_name)
+    if source is None:
+        raise HTTPException(404, f"Camera '{camera_name}' is not running")
+    if not hasattr(source, "dejello"):
+        raise HTTPException(409, "IMU rolling-shutter correction is not available for this camera")
+    return source
+
+
+@router.get("/cameras/{camera_name}/dejello")
+def dejello_status(camera_name: str):
+    """IMU rolling-shutter correction state. Gyro data never leaves the rover; only this summary does."""
+    try:
+        return {"status": "ok", "dejello": _dejello_source(camera_name).dejello()}
+    except (RuntimeError, ValueError, TimeoutError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/cameras/{camera_name}/dejello")
+def configure_dejello(camera_name: str, request: DejelloRequest):
+    """Enable/disable correction, override or reset readout, or discard the calibration."""
+    readout = None if request.reset_readout else (request.readout_ms if request.readout_ms is not None else "keep")
+    try:
+        return {"status": "ok", "dejello": _dejello_source(camera_name).dejello(
+            enabled=request.enabled, readout_ms=readout, reset=request.reset_calibration)}
+    except (RuntimeError, ValueError, TimeoutError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/cameras/{camera_name}/capture")
