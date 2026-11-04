@@ -170,3 +170,51 @@ def test_dejello_corrects_only_with_calibration_and_fresh_gyro(tmp_path):
         assert d.calibration is None and not (tmp_path / 'cal.json').exists()
     finally:
         d.stop()
+
+
+def test_row_tables_match_exact_inverse():
+    r = Remapper(1280, 720)
+    for warp in [(30.0, -20.0, 0.0), (25.0, 12.0, 0.01), (-40.0, 30.0, -0.02)]:
+        mx, my = r.maps(warp, 1)
+        tolerance = 2e-3  # float32 tables vs float64 reference
+        for x, y in [(0, 0), (640, 360), (1279, 719), (100, 600), (1200, 50)]:
+            qx, qy = source_position(warp, float(x), float(y), 1280, 720)
+            assert abs(mx[y, x] - qx) < tolerance and abs(my[y, x] - qy) < tolerance, (warp, x, y, mx[y, x], qx, my[y, x], qy)
+        # Half-resolution chroma tables address the same scene points.
+        hx, hy = r.maps(warp, 2)
+        qx, qy = source_position(warp, 2 * 100 + 0.5, 2 * 50 + 0.5, 1280, 720)
+        assert abs(hx[50, 100] - ((qx + 0.5) / 2 - 0.5)) < tolerance and abs(hy[50, 100] - ((qy + 0.5) / 2 - 0.5)) < tolerance
+
+
+def test_strip_transforms_match_exact_inverse():
+    r = Remapper(1280, 720)
+    assert Remapper.strips_for(0.0, 1280) == 1
+    for warp, limit in [((30.0, -20.0, 0.0), 1e-3), ((25.0, 10.0, 0.004), 0.35), ((-40.0, 30.0, -0.02), 0.35)]:
+        for scale in (1, 2):
+            h, w = 720 // scale, 1280 // scale
+            mx, my = r.maps(warp, scale)
+            worst = 0.0
+            for r0, r1, M in r.strip_transforms(warp, scale, h, w, Remapper.strips_for(warp[2], w)):
+                X, Y = np.meshgrid(np.arange(w), np.arange(r1 - r0))
+                px = M[0, 0] * X + M[0, 1] * Y + M[0, 2]
+                py = M[1, 0] * X + M[1, 1] * Y + M[1, 2]
+                worst = max(worst, np.abs(px - mx[r0:r1]).max(), np.abs(py - my[r0:r1]).max())
+            assert worst < limit, (warp, scale, worst)
+    # Without roll the strip warp reproduces exact remapping, pixel for pixel (up to rounding).
+    y = texture(1280, 720, seed=9)
+    fast = r.apply([y, y[::2, ::2].copy(), y[::2, ::2].copy()], (30.0, -20.0, 0.0))[0]
+    mx, my = r.maps((30.0, -20.0, 0.0), 1)
+    exact = cv2.remap(y, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=16)
+    assert np.abs(fast[20:-20, 30:-30].astype(int) - exact[20:-20, 30:-30]).max() <= 2
+
+
+def test_pooled_strips_match_sequential():
+    from concurrent.futures import ThreadPoolExecutor
+    r = Remapper(1280, 720)
+    y = texture(1280, 720, seed=4); u = y[::2, ::2].copy()
+    with ThreadPoolExecutor(4) as pool:
+        for warp in [(18.0, 7.0, 0.0), (18.0, 7.0, 0.004)]:
+            a = r.apply([y, u, u.copy()], warp)
+            b = r.apply([y, u, u.copy()], warp, pool)
+            for pa, pb in zip(a, b):
+                assert np.abs(pa.astype(int) - pb).max() <= 2  # strip splits differ only by rounding

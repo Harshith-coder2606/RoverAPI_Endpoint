@@ -21,6 +21,7 @@ Must run on the system Python used by the worker (numpy 1.21, OpenCV 4.5).
 """
 from bisect import bisect_right
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
@@ -377,35 +378,117 @@ def source_position(warp, x, y, width, height):
 
 
 class Remapper:
-    """Resamples I420 planes. The displacement field is smooth, so it is evaluated at quarter
-    resolution and upscaled; exact pixel grids are added afterwards so edges stay aligned."""
+    """Resamples I420 planes with tables built from per-row coefficients.
+
+    source_position() is a two-step fixed point whose first step uses the row
+    alone, so its result is exactly  row terms + row terms * x (+ x^2 for y).
+    Evaluating that form takes a few broadcasts instead of per-pixel iteration
+    (about 13 ms -> a few ms at 720p) and matches source_position() exactly."""
 
     def __init__(self, width, height):
         self.width, self.height = width, height
-        self.cw, self.ch = max(2, width // 4), max(2, height // 4)
-        xs = (np.arange(self.cw, dtype=np.float32) + 0.5) * width / self.cw - 0.5
-        ys = (np.arange(self.ch, dtype=np.float32) + 0.5) * height / self.ch - 0.5
-        self.gx, self.gy = np.meshgrid(xs, ys)
-        self.grids = {}
+        self.planes = {}
         for scale in (1, 2):
             w, h = width // scale, height // scale
-            self.grids[scale] = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+            xp, yp = np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32)
+            # Plane pixel centres in full-resolution coordinates, relative to the image centre for x.
+            xc = ((xp + 0.5) * scale - 0.5 - width / 2).astype(np.float32)
+            yf = (yp.astype(np.float64) + 0.5) * scale - 0.5
+            self.planes[scale] = (xp, yp, xc, xc * xc, yf)
 
     def maps(self, warp, scale=1):
-        qx, qy = source_position(warp, self.gx, self.gy, self.width, self.height)
-        bx, by = self.grids[scale]
-        size = (bx.shape[1], by.shape[0])
-        dx = cv2.resize(((qx - self.gx) / scale).astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
-        dy = cv2.resize(((qy - self.gy) / scale).astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
-        return bx + dx, by + dy
+        vx, vy, vroll = warp
+        xp, yp, xc, xc2, yf = self.planes[scale]
+        H = self.height
+        s_a = yf / H - 0.5                       # first step: row only
+        rc = (yf + s_a * vy) / H - 0.5           # second step: s = rc + rk * xc
+        rk = s_a * vroll / H
+        kx = vx - vroll * (yf - H / 2)           # horizontal velocity of this row
+        f = lambda v: (v / scale).astype(np.float32)[:, None]
+        mx = xp[None, :] + f(rc * kx)
+        my = (yp[:, None] + f(rc * vy))
+        if vroll:
+            mx = mx + f(rk * kx) * xc[None, :]
+            my = my + f(rc * vroll + rk * vy) * xc[None, :] + f(rk * vroll) * xc2[None, :]
+        else:
+            my = np.broadcast_to(my, mx.shape)
+        return mx, np.ascontiguousarray(my, dtype=np.float32)
 
-    def apply(self, planes, warp):
-        """planes: [Y, U, V] uint8 arrays (U/V at half size). Returns new contiguous planes."""
-        out = []
+    def coefficients(self, warp, scale, rows):
+        """Exact source coordinates for plane rows `rows`: mx = xp + a + b*xc, my = yp + c + d*xc + e*xc^2."""
+        vx, vy, vroll = warp
+        H = self.height
+        yf = (np.asarray(rows, dtype=np.float64) + 0.5) * scale - 0.5
+        s_a = yf / H - 0.5
+        rc = (yf + s_a * vy) / H - 0.5
+        rk = s_a * vroll / H
+        kx = vx - vroll * (yf - H / 2)
+        return rc * kx / scale, rk * kx / scale, rc * vy / scale, (rc * vroll + rk * vy) / scale, rk * vroll / scale
+
+    def strip_transforms(self, warp, scale, h, w, strips=32):
+        """(r0, r1, M) per strip: M maps strip-local output pixels to source pixels.
+
+        Fitted at each strip's centre: exact without roll; with roll the mapping has
+        small x*y and x^2 terms (at most ~0.35 px at strip corners at 80 deg/s)."""
+        xc0 = 0.5 * scale - 0.5 - self.width / 2       # xc at plane column 0
+        dxc = float(scale)                              # xc step per plane column
+        xm = (w - 1) / 2
+        xcm = xc0 + dxc * xm
+        bounds = np.linspace(0, h, strips + 1).astype(int)
+        r0, r1 = bounds[:-1], bounds[1:]
+        keep = r1 > r0
+        r0, r1 = r0[keep], r1[keep]
+        # All strips at once: per-strip Python work would dominate the frame time.
+        top, ym, bottom = r0 - 0.5, (r0 + r1 - 1) / 2, r1 - 0.5
+        rows = np.concatenate([top, ym, bottom])
+        a, b, c, d, e = (v.reshape(3, -1) for v in self.coefficients(warp, scale, rows))
+        src_x = xm + a + b * xcm                         # exact source position at the centre column
+        src_y = rows.reshape(3, -1) + c + d * xcm + e * xcm * xcm
+        gx = 1 + b[1] * dxc                              # d/dx at the strip centre
+        gy = (d[1] + 2 * e[1] * xcm) * dxc
+        tx = (src_x[2] - src_x[0]) / (bottom - top)      # d/dy at the centre column
+        ty = (src_y[2] - src_y[0]) / (bottom - top)
+        oy = ym - r0                                     # strip-local row of the centre
+        M = np.stack([np.stack([gx, tx, src_x[1] - gx * xm - tx * oy], axis=1),
+                      np.stack([gy, ty, src_y[1] - gy * xm - ty * oy], axis=1)], axis=1)
+        return list(zip(r0.tolist(), r1.tolist(), M))
+
+    @staticmethod
+    def strips_for(vroll, width, tolerance_px=0.25):
+        """Strips needed so the roll cross-term error, measured at ~0.41 * |vroll| * width / strips,
+        stays under tolerance (capped at 32 strips: ~0.33 px at an extreme 80 deg/s roll).
+
+        Without roll the correction is one affine transform for the whole plane."""
+        if abs(vroll) < 1e-9:
+            return 1
+        return int(min(32, max(2, math.ceil(0.41 * abs(vroll) * width / tolerance_px))))
+
+    def apply(self, planes, warp, pool=None, min_strips=8):
+        """planes: [Y, U, V] uint8 arrays (U/V at half size). Returns new contiguous planes.
+
+        Strips are independent, so with a thread pool (and OpenCV single-threaded, which
+        avoids its ~0.3 ms per-call thread wake-up) they run in parallel: ~5 ms per 720p
+        frame on the rover. Without a pool, strips are only used as roll requires."""
+        jobs, out = [], []
         for i, plane in enumerate(planes):
-            mx, my = self.maps(warp, 1 if i == 0 else 2)
-            fill = 16 if i == 0 else 128  # black in limited-range YUV
-            out.append(cv2.remap(plane, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=fill))
+            h, w = plane.shape
+            result = np.empty((h, w), dtype=np.uint8)
+            out.append(result)
+            strips = self.strips_for(warp[2], w)
+            if pool is not None:
+                strips = max(strips, min_strips if i == 0 else max(1, min_strips // 2))
+            for r0, r1, M in self.strip_transforms(warp, 1 if i == 0 else 2, h, w, strips):
+                jobs.append((plane, M, w, r0, r1, result, 16 if i == 0 else 128))  # black in limited-range YUV
+
+        def run(job):
+            plane, M, w, r0, r1, result, fill = job
+            cv2.warpAffine(plane, M, (w, r1 - r0), dst=result[r0:r1], flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=fill)
+        if pool is None:
+            for job in jobs:
+                run(job)
+        else:
+            list(pool.map(run, jobs))
         return out
 
 
@@ -418,6 +501,9 @@ class Dejello:
         self.state_path = state_path
         self.gyro = GyroBuffer()
         self.remapper = Remapper(width, height)
+        # Strip warps run on our own pool; OpenCV's internal pool costs ~0.3 ms per call to wake.
+        cv2.setNumThreads(1)
+        self.pool = ThreadPoolExecutor(8, thread_name_prefix='dejello-warp')
         self.tracker = FlowTracker()
         self.video_readout = VideoReadoutEstimator()
         self.observations = deque(maxlen=900)
@@ -522,7 +608,7 @@ class Dejello:
             self.stats['no_gyro'] += 1
             return None
         warp = row_warp(cal, rate, self.width, self.height, readout)
-        out = self.remapper.apply(planes, warp)
+        out = self.remapper.apply(planes, warp, self.pool)
         self.stats['corrected'] += 1
         self.stats['warp_px'] = max(self.stats['warp_px'] * 0.98, math.hypot(warp[0], warp[1]))
         elapsed = (time.perf_counter() - started) * 1000
@@ -567,6 +653,7 @@ class Dejello:
     def stop(self):
         self.stopped = True
         self.wake.set()
+        self.pool.shutdown(wait=False)
 
     def status(self):
         first, last = self.gyro.span()
